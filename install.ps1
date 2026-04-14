@@ -150,4 +150,19 @@ Start-Sleep 1
 Write-Host "Starting service..."
 cmd.exe /c "sc start $ServiceName"
 
+
+# ------------------------------
+# Write version stamp
+# ------------------------------
+$version = Get-Content (Join-Path $BinDir "version.txt") -Raw
+$version = $version.Trim()
+$version | Set-Content (Join-Path $InstallDir "version.txt") -Force
+
+# Also write to registry (Intune can detect via registry)
+$regPath = "HKLM:\SOFTWARE\PiFocus\Agent"
+New-Item -Path $regPath -Force | Out-Null
+Set-ItemProperty -Path $regPath -Name "Version" -Value $version -Force
+Set-ItemProperty -Path $regPath -Name "InstallDir" -Value $InstallDir -Force
+
+Write-Host "Version $version written to registry and install dir."
 Write-Host "==== PiFocus Agent Installed Successfully ===="
