@@ -37,5 +37,8 @@ Start-Sleep 2
 Remove-Item -Recurse -Force $AgentDir -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force $ProgramDataDir -ErrorAction SilentlyContinue
 
+# Cleanup registry
+Remove-Item -Path "HKLM:\SOFTWARE\PiFocus" -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host "==== PiFocus Agent Removed ===="
 exit 0

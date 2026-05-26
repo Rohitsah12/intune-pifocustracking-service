@@ -1,27 +1,43 @@
 $ErrorActionPreference = "Continue"
 
-$ServiceName = "PiFocusWindowService"
+$ServiceName   = "PiFocusWindowService"
+$Root          = $PSScriptRoot
+$BinDir        = $Root
+$InstallDir    = "C:\Program Files\PiFocus\Agent"
+$ProgramDataDir= "C:\ProgramData\PiFocus"
+$ServiceExe    = Join-Path $InstallDir "WindowService.exe"
+$version       = "1.0.2"   # Update this value for each release
 
-# Root = folder where install.ps1 lives
-$Root = $PSScriptRoot
+# ------------------------------
+# Logging — set up FIRST so every step is captured
+# ------------------------------
+$LogDir  = "C:\ProgramData\PiFocus\Logs"
+$LogFile = Join-Path $LogDir "Install.log"
 
-# Binaries live in same folder
-$BinDir = $Root
+if (!(Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
 
-$InstallDir = "C:\Program Files\PiFocus\Agent"
-$ProgramDataDir = "C:\ProgramData\PiFocus"
+function Write-Log {
+    param (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry  = "$timestamp [$Level] $Message"
+    Write-Host $logEntry
+    Add-Content -Path $LogFile -Value $logEntry
+}
 
-$ServiceExe = Join-Path $InstallDir "WindowService.exe"
-
-Write-Host "==== PiFocus Agent Install Started ===="
-Write-Host "Binary source directory: $BinDir"
+Write-Log "==== PiFocus Agent Install Started (version $version) ===="
+Write-Log "Binary source directory: $BinDir"
 
 
 
 # ------------------------------
 # Stop existing service
 # ------------------------------
-Write-Host "Stopping existing service..."
+Write-Log "Stopping existing service..."
 cmd.exe /c "sc stop $ServiceName" | Out-Null
 Start-Sleep 3
 
@@ -32,32 +48,31 @@ if ($pidLine) {
     try {
         $servicePid = ($pidLine -split ":")[1].Trim()
         if ($servicePid -ne "0") {
-            Write-Host "Force killing service PID $servicePid"
+            Write-Log "Force killing service PID $servicePid"
             taskkill /F /PID $servicePid /T | Out-Null
         }
     }
     catch {
-        Write-Host "Could not parse service PID"
+        Write-Log "Could not parse service PID"
     }
 }
 
 # ------------------------------
 # Stop helper (safe)
 # ------------------------------
-Write-Host "Stopping HelperService if running..."
-# Use Get-Process to avoid noisy taskkill error when process not found
+Write-Log "Stopping HelperService if running..."
 $helperProc = Get-Process -Name "HelperService" -ErrorAction SilentlyContinue
 if ($helperProc) {
     try {
         Stop-Process -Id $helperProc.Id -Force -ErrorAction Stop
-        Write-Host "Stopped HelperService (PID $($helperProc.Id))"
+        Write-Log "Stopped HelperService (PID $($helperProc.Id))"
     }
     catch {
-        Write-Host "Failed to stop HelperService: $_"
+        Write-Log "Failed to stop HelperService: $_"
     }
 }
 else {
-    Write-Host "HelperService not running, continuing..."
+    Write-Log "HelperService not running, continuing..."
 }
 
 # ------------------------------
@@ -83,7 +98,7 @@ $RequiredFiles = @(
 foreach ($file in $RequiredFiles) {
     $path = Join-Path $BinDir $file
     if (!(Test-Path $path)) {
-        Write-Host "MISSING FILE: $path"
+        Write-Log "MISSING FILE: $path" "ERROR"
         exit 1
     }
 }
@@ -91,7 +106,7 @@ foreach ($file in $RequiredFiles) {
 # ------------------------------
 # Copy binaries
 # ------------------------------
-Write-Host "Copying service + DLLs..."
+Write-Log "Copying service + DLLs..."
 Copy-Item (Join-Path $BinDir "WindowService.exe") $InstallDir -Force
 Copy-Item (Join-Path $BinDir "libcrypto-3-x64.dll") $InstallDir -Force
 Copy-Item (Join-Path $BinDir "libssl-3-x64.dll") $InstallDir -Force
@@ -101,7 +116,7 @@ Copy-Item (Join-Path $BinDir "vcruntime140_1.dll") $InstallDir -Force
 Copy-Item (Join-Path $BinDir "sentry.h") $InstallDir -Force
 
 
-Write-Host "Copying helper..."
+Write-Log "Copying helper..."
 Copy-Item (Join-Path $BinDir "HelperService.exe") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "libcrypto-3-x64.dll") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "libssl-3-x64.dll") $ProgramDataDir -Force
@@ -110,28 +125,43 @@ Copy-Item (Join-Path $BinDir "crashpad_handler.exe") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "vcruntime140_1.dll") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "sentry.h") $ProgramDataDir -Force
 # ------------------------------
-# Delete service if exists
+# Delete service if exists — wait until truly gone
 # ------------------------------
+Write-Log "Deleting existing service (if any)..."
 cmd.exe /c "sc delete $ServiceName" | Out-Null
-Start-Sleep 2
+
+$waitSec = 0
+while ($waitSec -lt 30) {
+    $svcCheck = cmd.exe /c "sc query $ServiceName" 2>&1
+    if ($svcCheck -match "1060") { break }   # 1060 = service does not exist
+    Write-Log "Waiting for service deletion... ($waitSec s)"
+    Start-Sleep 2
+    $waitSec += 2
+}
+
+if ($waitSec -ge 30) {
+    Write-Log "Service could not be deleted within 30 seconds. Aborting." "ERROR"
+    exit 1
+}
+
+Write-Log "Service deleted (or was never present)."
 
 # ------------------------------
 # Create service
 # ------------------------------
-Write-Host "Creating Windows service..."
+Write-Log "Creating Windows service..."
 
 $binPath = '"' + $ServiceExe + ' --service"'
 
 $createCmd = "sc create $ServiceName binPath= $binPath start= auto DisplayName= `"PiFocus Window Service`" obj= LocalSystem"
 
-Write-Host "CREATE CMD:"
-Write-Host $createCmd
+Write-Log "CREATE CMD: $createCmd"
 
 $createResult = cmd.exe /c $createCmd
-Write-Host $createResult
+Write-Log "SC CREATE result: $createResult"
 
 if ($createResult -notmatch "SUCCESS") {
-    Write-Host "SERVICE CREATION FAILED"
+    Write-Log "SERVICE CREATION FAILED" "ERROR"
     exit 1
 }
 
@@ -147,22 +177,66 @@ cmd.exe /c "sc failure $ServiceName reset= 86400 actions= restart/5000/restart/1
 Start-Sleep 1
 
 
-Write-Host "Starting service..."
+Write-Log "Starting service..."
 cmd.exe /c "sc start $ServiceName"
 
+Write-Log "--------------------------------------------"
+Write-Log "PiFocus Agent Versioning Started"
+Write-Log "Target Version: $version"
 
 # ------------------------------
-# Write version stamp
+# Write Version to Install Directory
 # ------------------------------
-$version = Get-Content (Join-Path $BinDir "version.txt") -Raw
-$version = $version.Trim()
-$version | Set-Content (Join-Path $InstallDir "version.txt") -Force
+try {
+    $versionFilePath = Join-Path $InstallDir "version.txt"
+    Write-Log "Writing version to file: $versionFilePath"
 
-# Also write to registry (Intune can detect via registry)
-$regPath = "HKLM:\SOFTWARE\PiFocus\Agent"
-New-Item -Path $regPath -Force | Out-Null
-Set-ItemProperty -Path $regPath -Name "Version" -Value $version -Force
-Set-ItemProperty -Path $regPath -Name "InstallDir" -Value $InstallDir -Force
+    $version | Set-Content -Path $versionFilePath -Force
 
-Write-Host "Version $version written to registry and install dir."
-Write-Host "==== PiFocus Agent Installed Successfully ===="
+    Write-Log "Version file written successfully."
+}
+catch {
+    Write-Log "Failed to write version file. Error: $_" "ERROR"
+    exit 1
+}
+
+# ------------------------------
+# Write Version to Windows Registry (temporarily disabled)
+# ------------------------------
+# try {
+#     $regPath = "HKLM:\SOFTWARE\PiFocus\Agent"
+#     Write-Log "Ensuring registry path exists: $regPath"
+#
+#     if (!(Test-Path $regPath)) {
+#         New-Item -Path $regPath -Force | Out-Null
+#         Write-Log "Registry path created."
+#     } else {
+#         Write-Log "Registry path already exists."
+#     }
+#
+#     Write-Log "Writing Version=$version to registry."
+#     Set-ItemProperty -Path $regPath -Name "Version" -Value $version -Force
+#
+#     Write-Log "Writing InstallDir=$InstallDir to registry."
+#     Set-ItemProperty -Path $regPath -Name "InstallDir" -Value $InstallDir -Force
+#
+#     Write-Log "Registry values written successfully."
+# }
+# catch {
+#     Write-Log "Failed to write registry values. Error: $_" "ERROR"
+#     exit 1
+# }
+#
+# # Verify Registry Values
+# try {
+#     Write-Log "Verifying registry entries..."
+#     $regValues = Get-ItemProperty -Path $regPath
+#     Write-Log "Registry Version: $($regValues.Version)"
+#     Write-Log "Registry InstallDir: $($regValues.InstallDir)"
+# }
+# catch {
+#     Write-Log "Failed to verify registry values. Error: $_" "ERROR"
+# }
+
+Write-Log "PiFocus Agent Versioning Completed Successfully"
+Write-Log "==== PiFocus Agent Installed Successfully ===="

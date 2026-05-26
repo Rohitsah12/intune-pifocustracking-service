@@ -3,10 +3,10 @@
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$ServiceName   = "PiFocusWindowService"
-$ServiceExe    = "C:\Program Files\PiFocus\Agent\WindowService.exe"
-$TargetVersion = "1.0.0"   
-$RegPath       = "HKLM:\SOFTWARE\PiFocus\Agent"
+$ServiceName      = "PiFocusWindowService"
+$ServiceExe       = "C:\Program Files\PiFocus\Agent\WindowService.exe"
+$VersionFile      = "C:\Program Files\PiFocus\Agent\version.txt"
+$TargetVersion    = "1.0.2"
 
 Write-Host "=== PiFocus Agent Detection (target: $TargetVersion) ==="
 
@@ -16,8 +16,13 @@ if (-not (Test-Path $ServiceExe)) {
     exit 1
 }
 
-# Check registry version
-$installedVersion = (Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue).Version
+# Check version.txt
+if (-not (Test-Path $VersionFile)) {
+    Write-Host "FAIL: version.txt missing"
+    exit 1
+}
+
+$installedVersion = (Get-Content -Path $VersionFile -Raw).Trim()
 Write-Host "Installed version: $installedVersion"
 
 if ($installedVersion -ne $TargetVersion) {
