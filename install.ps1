@@ -91,8 +91,10 @@ $RequiredFiles = @(
     "libssl-3-x64.dll",
     "sentry.dll",
     "crashpad_handler.exe",
+    "msvcp140.dll",
+    "vcruntime140.dll",
     "vcruntime140_1.dll",
-    "sentry.h"  
+    "sentry.h"
 )
 
 foreach ($file in $RequiredFiles) {
@@ -112,6 +114,11 @@ Copy-Item (Join-Path $BinDir "libcrypto-3-x64.dll") $InstallDir -Force
 Copy-Item (Join-Path $BinDir "libssl-3-x64.dll") $InstallDir -Force
 Copy-Item (Join-Path $BinDir "sentry.dll") $InstallDir -Force
 Copy-Item (Join-Path $BinDir "crashpad_handler.exe") $InstallDir -Force
+# Full app-local CRT trio - independent of whatever VC++ Redistributable
+# version is installed system-wide. Avoids the MSVCP140 14.11 ABI skew that
+# crashed WindowService.exe on devices with the 2017 redist.
+Copy-Item (Join-Path $BinDir "msvcp140.dll") $InstallDir -Force
+Copy-Item (Join-Path $BinDir "vcruntime140.dll") $InstallDir -Force
 Copy-Item (Join-Path $BinDir "vcruntime140_1.dll") $InstallDir -Force
 Copy-Item (Join-Path $BinDir "sentry.h") $InstallDir -Force
 
@@ -122,6 +129,8 @@ Copy-Item (Join-Path $BinDir "libcrypto-3-x64.dll") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "libssl-3-x64.dll") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "sentry.dll") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "crashpad_handler.exe") $ProgramDataDir -Force
+Copy-Item (Join-Path $BinDir "msvcp140.dll") $ProgramDataDir -Force
+Copy-Item (Join-Path $BinDir "vcruntime140.dll") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "vcruntime140_1.dll") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "sentry.h") $ProgramDataDir -Force
 # ------------------------------
