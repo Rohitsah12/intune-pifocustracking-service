@@ -1,0 +1,20 @@
+{
+  "name": "pifocus-pause-resume-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Conformance, load, concurrency and socket tests for PiFocus pause/resume state sync",
+  "scripts": {
+    "test": "node run-tests.js",
+    "test:stage": "cross-env PIFOCUS_ENV=stage node run-tests.js",
+    "test:full": "node run-tests.js --include-destructive",
+    "test:load": "node run-tests.js --only=load,concurrency,soak --load-iterations=500",
+    "test:soak": "node run-tests.js --only=soak --soak-seconds=300",
+    "test:socket": "node socket-tests.js",
+    "mock": "node mock-socket-server.js",
+    "state": "node check-state.js",
+    "watch": "node check-state.js --watch"
+  },
+  "dependencies": {
+    "socket.io": "^4.7.5"
+  }
+}

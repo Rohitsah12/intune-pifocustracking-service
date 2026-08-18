@@ -1,35 +1,48 @@
 <#
 ==============================================================================
- PiFocus Agent - One-Shot Diagnostics  (READ-ONLY)
+ PiFocus Agent - One-Shot Diagnostics  (READ-ONLY, STANDALONE, PROD-ONLY)
 ==============================================================================
+ Zero dependencies. Zero parameters. Just download this ONE file and run.
+ Every path/name below is hardcoded to production. Works identically for
+ both install topologies:
+   - Intune install     (C:\Program Files\PiFocus\Agent + Windows service)
+   - Electron desktop   (%LOCALAPPDATA%\Programs\pi-focus-business-app)
+ If a section's paths do not exist on the device, that section shows INFO
+ and moves on -- no crash, no missing-dependency error.
+
  Run as: ADMIN PowerShell, while the AFFECTED USER is logged in.
-   Right-click PowerShell -> Run as administrator, then:
+   Right-click PowerShell -> "Run as administrator", then:
      powershell -ExecutionPolicy Bypass -File .\diagnose.ps1
 
  What it answers: "Why is no activity data reaching the backend (0 hrs)?"
- It walks the whole data path and prints a single ROOT-CAUSE verdict:
-
-   WindowService (SYSTEM) --spawns--> HelperService (user session)
-        --named pipe--> reads token (HKCU\Software\PiFocus\Helper\DeviceApiKey)
-        --HTTPS--> api.penpencil.co  (/agent/ingest/activities)
+ It walks the whole data path and prints a single ROOT-CAUSE verdict.
 
  It modifies NOTHING. It only reads files, registry, services, event log.
 ==============================================================================
 #>
 
 #------------------------------------------------------------------- constants
-$AgentDir     = "C:\Program Files\PiFocus\Agent"
+# Hardcoded PROD values. If you ever need to diagnose staging, this is the
+# wrong tool -- staging has its own suffix ("Stage") on every path/service
+# name and this script won't find any of it. That is intentional: the
+# 99% case is "prod device, something is wrong, tell me why", and every
+# extra param (or Env-Config.ps1 dependency) has burned us in the field
+# when the recipient's Downloads folder didn't have the sibling file.
+$AgentDir     = 'C:\Program Files\PiFocus\Agent'
 $AgentExe     = Join-Path $AgentDir "WindowService.exe"
 $VersionFile  = Join-Path $AgentDir "version.txt"
-$HelperDir    = "C:\ProgramData\PiFocus"
+$HelperDir    = 'C:\ProgramData\PiFocus'
 $HelperExe    = Join-Path $HelperDir "HelperService.exe"
-$InstallLog   = "C:\ProgramData\PiFocus\Logs\Install.log"
-$DebugLogDir  = "C:\ProgramData\ProgramMonitor\debugLogs"
-$ReportsDir   = "C:\ProgramData\ProgramMonitor\daily_reports"
-$SentryDir    = "C:\ProgramData\PiFocus\Agent\sentry\windowservice"
-$ServiceName  = "PiFocusWindowService"
-$BackendHost  = "api.penpencil.co"
+$InstallLog   = 'C:\ProgramData\PiFocus\Logs\Install.log'
+$DebugLogDir  = 'C:\ProgramData\ProgramMonitor\debugLogs'
+$ReportsDir   = 'C:\ProgramData\ProgramMonitor\daily_reports'
+$SentryDir    = 'C:\ProgramData\PiFocus\Agent\sentry\windowservice'
+$ServiceName  = 'PiFocusWindowService'
+$BackendHost  = 'api.penpencil.co'
 $ActivitiesEP = "ingest/activities"
+$HklmRoot     = 'HKLM:\SOFTWARE\PiFocus'
+$HkcuHelper   = 'Software\PiFocus\Helper'
+$PauseEvent   = 'Global\PiFocusPauseEvent'
 
 $AgentSiblingDlls = @("libcrypto-3-x64.dll","libssl-3-x64.dll","sentry.dll","crashpad_handler.exe","vcruntime140_1.dll")
 $CrtDlls          = @("MSVCP140.dll","VCRUNTIME140.dll","VCRUNTIME140_1.dll")
@@ -138,6 +151,56 @@ if ($UserProfilePath) {
 } else {
     Check "User profile" "WARN" "could not resolve - Electron app log/binaries cannot be located"
 }
+
+# ------------ TEMP-profile detection ---------------------------------------
+# If Windows loaded a temporary profile at logon (real profile corrupted / stuck
+# / locked by another session), every per-user check below is a FALSE NEGATIVE
+# because the user's real HKCU, AppData, Run key, etc. are not on this session.
+# Flag it LOUDLY so IT doesn't chase 20 phantom problems.
+$Findings.TempProfile = $false
+$tempReason = $null
+if ($UserProfilePath -and $UserProfilePath -match "\((?i:Temp)\)\s*$|\\TEMP(\.[^\\]+)?$") {
+    $Findings.TempProfile = $true; $tempReason = "profile path suffix '(Temp)'"
+}
+if ($ConsoleSid) {
+    try {
+        $up = Get-CimInstance Win32_UserProfile -Filter "SID='$ConsoleSid'" -ErrorAction Stop
+        # Win32_UserProfile.Status bitmask: 1=Temporary, 8=Corrupted
+        if ($up.Status -band 1) { $Findings.TempProfile = $true; $tempReason = "Win32_UserProfile.Status has TEMPORARY bit set" }
+        if ($up.Status -band 8) { $Findings.TempProfile = $true; $tempReason = "Win32_UserProfile.Status has CORRUPTED bit set" }
+    } catch {}
+}
+if ($Findings.TempProfile) {
+    Check "TEMP profile detected" "FAIL" ("This session is on a Windows TEMPORARY profile ($tempReason). EVERY per-user check below (Electron app, token, autolaunch, app.log, HKCU) reflects the empty temp profile - NOT the user's real state. FIX the profile first (sign out + reboot; if still Temp, check Event Viewer -> User Profile Service, and HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<SID> for a .bak entry) then re-run this script.")
+} else {
+    Check "TEMP profile detected" "PASS" "real profile loaded"
+}
+
+# ------------ BIOS serial (Win32_BIOS is Win11-24H2+-proof, wmic isn't) -----
+try {
+    $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop
+    $serial = ($bios.SerialNumber -as [string])
+    if ($serial) { $serial = $serial.Trim() }
+    if ([string]::IsNullOrWhiteSpace($serial) -or $serial -match "^(?i:default string|to be filled by o\.e\.m|to be filled|none|na|n/a|unknown|system serial number|0)$") {
+        Check "BIOS serial number" "WARN" ("'{0}' (placeholder - backend may reject or dedupe under a UUID-style fallback)" -f $bios.SerialNumber)
+    } else {
+        Check "BIOS serial number" "PASS" $serial
+    }
+} catch { Check "BIOS serial number" "INFO" "could not query Win32_BIOS" }
+
+# ------------ Intune / AzureAD enrollment - answers "is this device managed?"
+try {
+    $dsr = & dsregcmd /status 2>$null
+    $azAd = if ($m = ($dsr | Select-String "^\s*AzureAdJoined\s*:\s*(YES|NO)").Matches) { $m.Groups[1].Value } else { "" }
+    $dom  = if ($m = ($dsr | Select-String "^\s*DomainJoined\s*:\s*(YES|NO)").Matches)   { $m.Groups[1].Value } else { "" }
+    $mdm  = if ($m = ($dsr | Select-String "^\s*MdmUrl\s*:\s*(.+)$").Matches)             { $m.Groups[1].Value.Trim() } else { "" }
+    $mdmYes = -not [string]::IsNullOrWhiteSpace($mdm)
+    $joinType = if ($azAd -eq "YES") { "AzureAD-joined" } elseif ($dom -eq "YES") { "AD-joined" } else { "Workgroup (personal device)" }
+    $Findings.IntuneEnrolled = $mdmYes
+    $Findings.PersonalDevice = ($azAd -ne "YES" -and $dom -ne "YES")
+    if ($mdmYes) { Check "Device enrollment" "PASS" ("{0} + MDM-enrolled ({1})" -f $joinType,$mdm) }
+    else         { Check "Device enrollment" "INFO" ("{0}, no MDM enrollment - Intune push not possible, expect Electron install topology" -f $joinType) }
+} catch { Check "Device enrollment" "INFO" "dsregcmd not available" }
 
 #============================================================================ 1
 Section "1. INSTALLATION INTEGRITY"
@@ -280,6 +343,24 @@ if (-not $ElectronAppExe) {
     } else { Check "Electron Chromium crash dumps" "INFO" "no Crashpad dir (no crashes recorded, or app never launched)" }
 }
 
+# ------------ Detected deployment topology --------------------------------
+# Prints the ONE thing the Intune team wants to see first: which install
+# topology this device is actually using, cross-referenced with whether the
+# device is even MDM-enrolled. Catches "Electron app on a company machine
+# that should have been Intune-only" and "no PiFocus at all on a device
+# that should have been assigned the Intune app".
+$topo =
+    if     ($Findings.AgentExe -and $Findings.ElectronAppInstalled) { "BOTH (Intune install + Electron app both present)" }
+    elseif ($Findings.AgentExe)                                      { "Intune-only" }
+    elseif ($Findings.ElectronAppInstalled)                          { "Electron-only" }
+    else                                                             { "NONE - PiFocus is not installed on this device" }
+$Findings.Topology = $topo
+$expected = if ($Findings.IntuneEnrolled) { "Intune" } elseif ($Findings.PersonalDevice) { "Electron" } else { "either" }
+$mismatch = ($Findings.IntuneEnrolled -and $topo -eq "Electron-only") -or ($Findings.PersonalDevice -and $topo -eq "Intune-only")
+$st = if ($topo -like "NONE*") { "FAIL" } elseif ($topo -like "BOTH*" -or $mismatch) { "WARN" } else { "PASS" }
+$note = if ($mismatch) { "  <-- MISMATCH: device enrollment expects $expected topology" } else { "" }
+Check "Detected deployment topology" $st ($topo + $note)
+
 #============================================================================ 2
 Section "2. WINDOWS SERVICE ($ServiceName)"
 $svc = $null
@@ -294,11 +375,27 @@ if (-not $svc) {
     if ($svc.StartMode -ne "Auto") { Check "Start type" "WARN" ("expected Auto, got {0}" -f $svc.StartMode) }
     if ($svc.PathName -notmatch "--service") { Check "ImagePath has --service" "WARN" $svc.PathName }
     else { Check "ImagePath" "INFO" $svc.PathName }
+
+    # ZOMBIE-service detection - a common failure mode we've seen in the field:
+    # an old Electron install created the service pointing at its per-user
+    # binary, then the app was uninstalled but the uninstaller did NOT run
+    # 'sc delete $ServiceName'. The service registration remains and
+    # points at a deleted .exe. Every start attempt logs Event 7000, no data
+    # flows, and everything else in the diagnose looks superficially OK.
+    if ($svc.PathName -match '^\s*"([^"]+\.exe)"' -or $svc.PathName -match '^\s*(\S+\.exe)') {
+        $svcExe = $matches[1]
+        if ($svcExe -and -not (Test-Path $svcExe)) {
+            $Findings.StaleImagePath = $true
+            Check "Service binary on disk" "FAIL" ("$svcExe -- DELETED. The service registration is a ZOMBIE, points at a binary that no longer exists. This is why the service cannot start. FIX: 'sc.exe delete $ServiceName' as admin, then reinstall the current package (Intune install.ps1 or Electron app).")
+        } elseif ($svcExe) {
+            Check "Service binary on disk" "PASS" ("exists at $svcExe")
+        }
+    }
 }
 
 # restart-loop counters written by the service itself
 try {
-    $pf = Get-ItemProperty "HKLM:\SOFTWARE\PiFocus" -ErrorAction Stop
+    $pf = Get-ItemProperty $HklmRoot -ErrorAction Stop
     if ($null -ne $pf.WS_FastRestartCount) {
         $rc = [int]$pf.WS_FastRestartCount
         $lastStart = if ($pf.WS_LastStartUnix) { (Get-Date "1970-01-01Z").AddSeconds([int]$pf.WS_LastStartUnix).ToLocalTime() } else { "?" }
@@ -314,11 +411,43 @@ try {
 Line ""
 Line "  -- Service Control Manager / crash events (last 3 days) --" "DarkGray"
 $since = (Get-Date).AddDays(-3)
+# SCM Win32-error decoder (used below for Event 7000)
+$ScmWin32Decode = @{
+    2    = "ERROR_FILE_NOT_FOUND -- ImagePath points to a deleted binary (zombie service)"
+    3    = "ERROR_PATH_NOT_FOUND -- the folder containing the exe is gone"
+    5    = "ERROR_ACCESS_DENIED -- LocalSystem cannot read/exec the binary (NTFS ACL, AV lock)"
+    1053 = "ERROR_SERVICE_REQUEST_TIMEOUT -- process didn't report RUNNING in time"
+    1056 = "ERROR_SERVICE_ALREADY_RUNNING"
+    1058 = "ERROR_SERVICE_DISABLED"
+    1067 = "ERROR_PROCESS_ABORTED -- process died (missing DLL / CRT skew / native crash)"
+    1068 = "ERROR_SERVICE_DEPENDENCY_FAIL"
+    1069 = "ERROR_SERVICE_LOGON_FAILED"
+    1083 = "ERROR_SERVICE_NOT_IN_EXE -- StartServiceCtrlDispatcher never called"
+}
 try {
     $scm = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Service Control Manager'; StartTime=$since} -ErrorAction Stop |
            Where-Object { $_.Message -match $ServiceName -or $_.Message -match "PiFocus" } | Select-Object -First 12
-    if ($scm) { foreach ($e in $scm) { Line ("    {0}  Id={1}  {2}" -f $e.TimeCreated, $e.Id, (($e.Message -split "`n")[0].Trim())) } }
-    else { Line "    (no SCM events mention the service)" "DarkGray" }
+    if ($scm) {
+        foreach ($e in $scm) {
+            # keep the full message (all non-empty lines joined) instead of truncating at the first newline
+            $lines = @($e.Message -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $head  = if ($lines.Count -gt 0) { $lines[0] } else { "" }
+            $tail  = if ($lines.Count -gt 1) { ($lines[1..($lines.Count-1)] -join "  |  ") } else { "" }
+            Line ("    {0}  Id={1}  {2}" -f $e.TimeCreated, $e.Id, $head)
+            if ($tail) { Line ("        {0}" -f $tail) "DarkGray" }
+            # Event 7000 / 7024: Properties[1] is the Win32 error code (or, for 7024, the service-specific exit)
+            if ($e.Id -in 7000,7024 -and $e.Properties.Count -ge 2) {
+                $code = $null
+                try { $code = [int]$e.Properties[1].Value } catch {}
+                if ($code -and $ScmWin32Decode.ContainsKey($code)) {
+                    Line ("        --> Win32 error {0}: {1}" -f $code, $ScmWin32Decode[$code]) "Yellow"
+                    if ($code -eq 2) { $Findings.StaleImagePath = $true }
+                    if ($code -eq 1067) { $Findings.CrashOnStart = $true }
+                    if ($code -eq 5) { $Findings.AclBlock = $true }
+                }
+            }
+        }
+    } else { Line "    (no SCM events mention the service)" "DarkGray" }
 } catch { Line "    (could not read System log: $($_.Exception.Message))" "DarkGray" }
 $ExitDecode = @{
     "c0000005" = "ACCESS_VIOLATION (in-code crash, bad pointer)"
@@ -599,19 +728,19 @@ if ($helpers.Count -eq 0) {
 }
 
 #============================================================================ 4
-Section "4. DEVICE TOKEN / AUTH  (HKCU\Software\PiFocus\Helper\DeviceApiKey)"
+Section ("4. DEVICE TOKEN / AUTH  (HKCU\{0}\DeviceApiKey)" -f $HkcuHelper)
 $token = $null
 $tokenSrc = $null
 if ($ConsoleSid) {
     try {
-        $p = Get-ItemProperty ("Registry::HKEY_USERS\{0}\Software\PiFocus\Helper" -f $ConsoleSid) -ErrorAction Stop
-        if ($p.DeviceApiKey) { $token = [string]$p.DeviceApiKey; $tokenSrc = "HKU\$ConsoleSid\Software\PiFocus\Helper" }
+        $p = Get-ItemProperty ("Registry::HKEY_USERS\{0}\{1}" -f $ConsoleSid, $HkcuHelper) -ErrorAction Stop
+        if ($p.DeviceApiKey) { $token = [string]$p.DeviceApiKey; $tokenSrc = ("HKU\{0}\{1}" -f $ConsoleSid, $HkcuHelper) }
     } catch {}
 }
 if (-not $token) {
     try {
-        $p = Get-ItemProperty "HKCU:\Software\PiFocus\Helper" -ErrorAction Stop
-        if ($p.DeviceApiKey) { $token = [string]$p.DeviceApiKey; $tokenSrc = "HKCU\Software\PiFocus\Helper" }
+        $p = Get-ItemProperty ("HKCU:\{0}" -f $HkcuHelper) -ErrorAction Stop
+        if ($p.DeviceApiKey) { $token = [string]$p.DeviceApiKey; $tokenSrc = ("HKCU\{0}" -f $HkcuHelper) }
     } catch {}
 }
 $Findings.TokenPresent = [bool]$token
@@ -626,7 +755,7 @@ if ($token) {
 #============================================================================ 5
 Section "5. TRACKING / PAUSE STATE"
 $trackVal = $null
-try { $pf2 = Get-ItemProperty "HKLM:\SOFTWARE\PiFocus" -ErrorAction Stop; $trackVal = $pf2.TrackingEnabled } catch {}
+try { $pf2 = Get-ItemProperty $HklmRoot -ErrorAction Stop; $trackVal = $pf2.TrackingEnabled } catch {}
 $Findings.Paused = $false
 if ($null -eq $trackVal) { Check "HKLM TrackingEnabled" "INFO" "not set (defaults to ENABLED)" }
 elseif ([int]$trackVal -eq 1) { Check "HKLM TrackingEnabled" "PASS" "1 = tracking ENABLED" }
@@ -644,7 +773,7 @@ public static extern uint WaitForSingleObject(System.IntPtr hHandle, uint dwMill
 public static extern bool CloseHandle(System.IntPtr hObject);
 "@ -ErrorAction Stop
     }
-    $h = [PiFocus.Evt]::OpenEvent(0x00100000, $false, "Global\PiFocusPauseEvent")  # SYNCHRONIZE
+    $h = [PiFocus.Evt]::OpenEvent(0x00100000, $false, $PauseEvent)  # SYNCHRONIZE
     if ($h -ne [IntPtr]::Zero) {
         $w = [PiFocus.Evt]::WaitForSingleObject($h, 0)   # 0 = signaled (paused), 258 = non-signaled (active)
         [void][PiFocus.Evt]::CloseHandle($h)
@@ -760,22 +889,112 @@ if (-not (Test-Path $DebugLogDir)) {
 Section "7b. LOCAL DATA (daily_reports)"
 if (-not (Test-Path $ReportsDir)) { Check "daily_reports folder" "WARN" "$ReportsDir missing - no local data produced yet" }
 else {
-    $rep = @(Get-ChildItem $ReportsDir -Filter "*.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
-    if ($rep.Count -eq 0) { Check "daily_reports content" "WARN" "no report files - tracking likely not running" }
+    $allRep = @(Get-ChildItem $ReportsDir -Filter "*.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if ($allRep.Count -eq 0) { Check "daily_reports content" "WARN" "no report files - tracking likely not running" }
     else {
-        $r = $rep[0]
+        $r = $allRep[0]
         $Findings.LocalDataExists = ($r.Length -gt 50)
         $st = if ($r.Length -gt 50) { "PASS" } else { "WARN" }
         Check "Latest daily report" $st ("{0}  size={1}B  modified={2}" -f $r.Name,$r.Length,$r.LastWriteTime)
+
+        # Gap detection: which of the last 14 calendar days have NO report file?
+        # Reports are named "YYYY-MM-DD.json". Weekends/leave are fine, but a
+        # missing weekday between two present days = service crashed that day.
+        $havingSet = @{}
+        foreach ($f in $allRep) { $havingSet[$f.Name] = $true }
+        $today = Get-Date
+        $missing = @()
+        for ($i = 0; $i -lt 14; $i++) {
+            $d = $today.AddDays(-$i).ToString("yyyy-MM-dd")
+            if (-not $havingSet.ContainsKey("$d.json")) { $missing += $d }
+        }
+        if ($missing.Count -eq 0) {
+            Check "Report continuity (last 14 days)" "PASS" "no gaps"
+        } else {
+            # weekends are expected; call out only if a gap looks like a weekday
+            $weekdayGaps = @($missing | Where-Object {
+                $dow = [DateTime]::Parse($_).DayOfWeek
+                $dow -ne 'Saturday' -and $dow -ne 'Sunday'
+            })
+            $st = if ($weekdayGaps.Count -gt 0) { "WARN" } else { "INFO" }
+            $note = if ($weekdayGaps.Count -gt 0) { "  (weekday gaps in bold: " + ($weekdayGaps -join ", ") + ")" } else { "  (weekend/holiday only)" }
+            Check "Report continuity (last 14 days)" $st ("missing: {0}{1}" -f ($missing -join ", "),$note)
+        }
     }
 }
 
 # install log tail
 if (Test-Path $InstallLog) {
     Section "7c. INSTALL LOG (tail)"
-    foreach ($ln in (Get-Content $InstallLog -Tail 25 -ErrorAction SilentlyContinue)) {
+    # Tail 80 (up from 25) because the 1.0.5+ install.ps1 writes a much
+    # longer per-install block: PACKAGE INVENTORY (~10 lines) + freshness
+    # checks + Copy-ItemVerified per-file rows + POST-INSTALL VERIFICATION
+    # + VERDICT banner. Tail 25 would truncate everything before the final
+    # verdict and we'd lose the copy evidence.
+    foreach ($ln in (Get-Content $InstallLog -Tail 80 -ErrorAction SilentlyContinue)) {
         $c = if ($ln -match "\[ERROR\]") { "Red" } else { "DarkGray" }
         Line ("    $ln") $c
+    }
+
+    # Install-script generation check: 1.0.5+ install.ps1 always writes a
+    # "VERDICT env=... version=... Helper_fresh=... Window_fresh=..." line
+    # as its final action. If that line is ABSENT from the entire log, IT
+    # is still deploying the pre-1.0.5 .intunewin and the new safeguards
+    # (source marker preflight, Copy-ItemVerified, post-install marker
+    # check, verdict banner) never ran on this device. This is the exact
+    # failure mode that left Drashti / Jahanvi with a stale June-3 Helper.
+    $verdictLines = @(Get-Content $InstallLog -ErrorAction SilentlyContinue | Where-Object { $_ -match 'VERDICT env=' })
+    if ($verdictLines.Count -gt 0) {
+        $Findings.NewInstallScriptRan = $true
+        $latest = $verdictLines[-1]
+        Check "New install script generation (1.0.5+)" "PASS" ("saw: " + $latest.Trim())
+        # If any verdict shows Helper_fresh=False, that means the marker
+        # check tripped -- stale binary somehow reached the device.
+        if ($latest -match 'Helper_fresh=False|Window_fresh=False') {
+            $Findings.StaleBinaryOnDevice = $true
+            Check "Post-install marker verification" "FAIL" "install.ps1 detected a STALE binary on disk. See PACKAGE INVENTORY lines above."
+        }
+    } else {
+        $Findings.OldInstallScriptStillDeployed = $true
+        Check "New install script generation (1.0.5+)" "FAIL" "no 'VERDICT env=' line anywhere in Install.log -- IT is still deploying the pre-1.0.5 .intunewin. New marker-safeguards never ran on this device. FIX: IT must upload the new install.intunewin (version 1.0.5) to Intune, replacing the currently-deployed package."
+    }
+}
+
+# Intune Management Extension log - the gold standard for "did Intune try to
+# push PiFocus to this device, and if so what happened?" Only relevant on
+# MDM-enrolled devices; ignored on personal ones.
+if ($Findings.IntuneEnrolled) {
+    $imeLogDir = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    if (Test-Path $imeLogDir) {
+        $imeLogs = @(Get-ChildItem $imeLogDir -Filter "IntuneManagementExtension*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 3)
+        if ($imeLogs.Count -gt 0) {
+            Section "7c2. INTUNE MANAGEMENT EXTENSION LOG (PiFocus mentions)"
+            $piLines = @()
+            foreach ($log in $imeLogs) {
+                try {
+                    $lines = Get-Content $log.FullName -Tail 5000 -ErrorAction SilentlyContinue
+                    $piLines += ($lines | Where-Object { $_ -match "PiFocus|piFocus|pi-focus" })
+                } catch {}
+            }
+            if ($piLines.Count -gt 0) {
+                Line ("    {0} PiFocus-mentioning lines across the last {1} IME log file(s)" -f $piLines.Count,$imeLogs.Count) "DarkGray"
+                # Show the last 20 lines - if the install failed, the error is here
+                foreach ($ln in ($piLines | Select-Object -Last 20)) {
+                    $short = if ($ln.Length -gt 280) { $ln.Substring(0,280) + "..." } else { $ln }
+                    $c = if ($ln -match "\bError\b|Failed|Failure|0x[0-9a-fA-F]{8}") { "Red" }
+                         elseif ($ln -match "\bSuccess\b|Installed successfully|Detection succeeded") { "Green" }
+                         else { "DarkGray" }
+                    Line ("    $short") $c
+                }
+                # count outcomes
+                $errCount  = @($piLines | Where-Object { $_ -match "\bError\b|Failed|Failure" }).Count
+                $succCount = @($piLines | Where-Object { $_ -match "Installed successfully|Detection succeeded|installation successful" }).Count
+                if ($errCount -gt 0)  { $Findings.IntuneInstallFailed = $true; Check "Intune IME: PiFocus install errors" "FAIL" ("$errCount error-line(s) in IME log - Intune tried to install PiFocus and it failed. See lines above.") }
+                if ($succCount -gt 0) { Check "Intune IME: PiFocus install successes" "PASS" ("$succCount success-line(s) - Intune has installed PiFocus at some point on this device") }
+            } else {
+                Check "Intune IME: PiFocus mentions" "WARN" "no PiFocus mentions in the last 3 IME log files. Either this device is not in the PiFocus assignment group, OR the assignment reached it before these log files were rotated in. Check MEM console for this device's app assignment status."
+            }
+        }
     }
 }
 
@@ -843,7 +1062,18 @@ Section "8. ROOT-CAUSE VERDICT"
 $verdict = New-Object System.Collections.Generic.List[string]
 $luc = if ($Findings.LastUploadCode) { [int]$Findings.LastUploadCode } else { 0 }
 
-if (-not $svc) {
+# TOP PRIORITY: if we're on a TEMP Windows profile, nothing below matters -
+# every per-user finding is a false negative. Send IT to fix the profile first.
+if ($Findings.TempProfile) {
+    $verdict.Add("TEMPORARY WINDOWS PROFILE - this session is on an empty temp profile, so EVERY per-user 'FAIL' above (Electron app, token, autolaunch, app.log, HKCU) is a false negative. The user's real profile is not loaded, so we cannot tell what state her actual install is in. FIX: sign her out + reboot. If Windows still loads a temp profile, check Event Viewer -> User Profile Service, and look for a '<SID>.bak' entry under HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList that needs to be renamed back. Re-run this script after she is on her real profile.")
+}
+# NEXT PRIORITY: zombie service registration - service is registered but its
+# ImagePath points to a deleted binary. Common after Electron app uninstall
+# without 'sc delete'. Would have caught Pradip's case immediately.
+elseif ($Findings.StaleImagePath) {
+    $verdict.Add("ZOMBIE SERVICE REGISTRATION - $ServiceName is registered but its ImagePath points to a binary that no longer exists (section 2 flagged 'Service binary on disk: FAIL', or SCM Event 7000 returned Win32 error 2). This is what happens when the Electron app is uninstalled without also running 'sc delete $ServiceName'. FIX: 'sc.exe stop $ServiceName; sc.exe delete $ServiceName' as admin, then push the current Intune package OR reinstall the current Electron app. The install script will create a fresh service pointing at the correct binary.")
+}
+elseif (-not $svc) {
     if ($Findings.UacCancelled -or $Findings.ElectronInstallFailed) {
         $verdict.Add("UAC ELEVATION DECLINED: the user clicked 'No'/'Cancel' on the PiFocus app's UAC prompt, so the Windows service was never created (section 7d shows 'User did not grant permission'). Until the service is installed, nothing is captured -> 0 hrs. FIX: open the PiFocus desktop app and click 'Yes' on the UAC prompt. If the user keeps closing it, they need to accept it once - the app cannot install the service without admin elevation.")
     } elseif (-not $Findings.AgentExe -and -not $Findings.ElectronInstalled) {
@@ -854,7 +1084,7 @@ if (-not $svc) {
 }
 elseif (-not $Findings.SvcRunning) {
     if ($Findings.WerCrtMismatch -or $Findings.RedistTooOld) {
-        $verdict.Add("VC++ RUNTIME MISMATCH -> Error 1067 / ACCESS_VIOLATION inside MSVCP140 or VCRUNTIME140. The device has CRT DLLs (System32) older than the toolset that built our binary (14.30+). Section 2c shows the fault module and version; section 1 shows the installed redist version. FIX (immediate, fastest): install https://aka.ms/vs/17/release/vc_redist.x64.exe and 'sc start PiFocusWindowService'. FIX (permanent): the latest install.ps1 bundles msvcp140.dll + vcruntime140.dll next to WindowService.exe so the device's redist version stops mattering - redeploy that build.")
+        $verdict.Add("VC++ RUNTIME MISMATCH -> Error 1067 / ACCESS_VIOLATION inside MSVCP140 or VCRUNTIME140. The device has CRT DLLs (System32) older than the toolset that built our binary (14.30+). Section 2c shows the fault module and version; section 1 shows the installed redist version. FIX (immediate, fastest): install https://aka.ms/vs/17/release/vc_redist.x64.exe and 'sc start $ServiceName'. FIX (permanent): the latest install.ps1 bundles msvcp140.dll + vcruntime140.dll next to WindowService.exe so the device's redist version stops mattering - redeploy that build.")
     } elseif ($Findings.IfeoHijack) {
         $verdict.Add("SERVICE CANNOT START: Image File Execution Options key on WindowService.exe has a Debugger/GlobalFlag set (section 2b). Remove it: 'reg delete HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\WindowService.exe /f'.")
     } elseif ($Findings.ArchMismatch) {
@@ -886,17 +1116,17 @@ elseif (-not $Findings.HelperInUserSession) {
 }
 elseif (-not $Findings.TokenPresent) {
     if ($Findings.AsarLoadFail) {
-        $verdict.Add("DEVICE TOKEN MISSING + APP UI BROKEN: HKCU\Software\PiFocus\Helper\DeviceApiKey is absent AND the Electron app cannot load app.asar (ERR_FAILED in section 7d). The user can't complete login because the UI never renders. Almost always Defender/AV quarantine of the asar or a corrupted install. FIX: add a Defender exclusion for %LOCALAPPDATA%\Programs\pi-focus-business-app\ and reinstall the PiFocus app.")
+        $verdict.Add("DEVICE TOKEN MISSING + APP UI BROKEN: HKCU\$HkcuHelper\DeviceApiKey is absent AND the Electron app cannot load app.asar (ERR_FAILED in section 7d). The user can't complete login because the UI never renders. Almost always Defender/AV quarantine of the asar or a corrupted install. FIX: add a Defender exclusion for %LOCALAPPDATA%\Programs\pi-focus-business-app\ and reinstall the PiFocus app.")
     } elseif (-not $Findings.ElectronAppInstalled) {
         $verdict.Add("DEVICE TOKEN MISSING + APP NOT INSTALLED: the PiFocus desktop app .exe is not present on this user profile. The user has no way to sign in -> no token -> no upload auth. FIX: install the PiFocus desktop app.")
     } elseif (-not $Findings.ElectronAppRunning) {
         $verdict.Add("DEVICE TOKEN MISSING + APP NOT RUNNING: the token registry value is absent and the PiFocus app is not currently running. FIX: open the PiFocus app, complete sign-in, and verify auto-launch (section 1b).")
     } else {
-        $verdict.Add("DEVICE TOKEN MISSING: HKCU\Software\PiFocus\Helper\DeviceApiKey is not set even though the app is running. The user has not finished login. FIX: have the user click 'Sign in with Google' inside the PiFocus app.")
+        $verdict.Add("DEVICE TOKEN MISSING: HKCU\$HkcuHelper\DeviceApiKey is not set even though the app is running. The user has not finished login. FIX: have the user click 'Sign in with Google' inside the PiFocus app.")
     }
 }
 elseif ($Findings.Paused) {
-    $verdict.Add("TRACKING IS PAUSED: HKLM\Software\PiFocus\TrackingEnabled=0 and/or the Global\PiFocusPauseEvent is signaled. No data is collected until tracking is resumed from the app.")
+    $verdict.Add("TRACKING IS PAUSED: $HklmRoot\TrackingEnabled=0 and/or the $PauseEvent event is signaled. No data is collected until tracking is resumed from the app.")
 }
 elseif (-not $Findings.BackendReachable) {
     $verdict.Add("BACKEND UNREACHABLE RIGHT NOW: this device cannot reach https://$BackendHost (DNS/firewall/proxy). Note the service uses WinHTTP, whose proxy is separate from the browser - see section 6. Data is collected locally but cannot upload -> 0 hrs.")
@@ -916,10 +1146,25 @@ elseif ($Findings.TransportFail) {
     $verdict.Add("INTERMITTENT NETWORK UPLOADS: the backend is reachable now, but the service's WinHTTP uploads have been failing at times (api.transport_fail). win32=12007 means DNS name-not-resolved - flaky DNS/VPN/proxy on this device. Data buffers locally and should catch up when the network is stable; if 0 hrs persists, investigate this device's DNS/VPN.")
 }
 else {
-    $verdict.Add("No single current smoking gun. Review every [FAIL]/[WARN] above and the intermittent-issues list below. Best next step: collect C:\ProgramData\ProgramMonitor\debugLogs\ and C:\ProgramData\PiFocus\Logs\Install.log from this device.")
+    $verdict.Add("No single current smoking gun. Review every [FAIL]/[WARN] above and the intermittent-issues list below. Best next step: collect $DebugLogDir\ and $InstallLog from this device.")
 }
 
 foreach ($v in $verdict) { Line ""; Line (">>> " + $v) "White" }
+
+# Install-script-generation warnings surface AFTER the primary verdict --
+# they can be a root cause on their own (stale Helper on disk breaks URL
+# categorization and per-instance UPN attribution even when everything
+# above looks fine), OR they can be secondary context for another verdict
+# (e.g. the primary said "backend unreachable now" but this line tells
+# you why prior uploads had no UPN stamp).
+if ($Findings.OldInstallScriptStillDeployed) {
+    Line ""
+    Line (">>> DEPLOYMENT LAG: this device is still running the pre-1.0.5 install script (no 'VERDICT env=' line in Install.log). The old script used plain Copy-Item with no lock/size verification, so a partial-install (fresh WindowService.exe + stale June-3 HelperService.exe) reports 'Installed Successfully' with no error. Ask IT to upload the new install.intunewin (version 1.0.5) to Intune. Every device that re-installs will then get PACKAGE INVENTORY logging, marker preflight, Copy-ItemVerified, and a VERDICT banner in Install.log.") "Yellow"
+}
+if ($Findings.StaleBinaryOnDevice) {
+    Line ""
+    Line (">>> STALE BINARY DETECTED: the new install.ps1's post-install marker check on this device reported Helper_fresh=False (or Window_fresh=False). Something between Copy-ItemVerified success and the final marker check restored an old binary -- most likely AV / EDR / sync tool intercepting %ProgramData%\PiFocus\HelperService.exe. Check Defender, any file-sync agents, and any group-policy that restores files in that folder.") "Yellow"
+}
 
 # Always-relevant warning: wmic gone on Win11 24H2+ means the Electron app
 # cannot read the BIOS serial. Even when everything else is fine, this can
@@ -946,18 +1191,64 @@ if ($script:Notable -and $script:Notable.Count -gt 0) {
 }
 
 #---------------------------------------------------------------- save report
+# IT team asked for a predictable, per-machine location AND a STABLE filename
+# instead of the user's Desktop with a timestamped filename. Reasoning:
+#   - Desktop can be OneDrive-redirected (C:\Users\<u>\OneDrive\Desktop\...)
+#     so collection scripts can't guess the path.
+#   - Timestamped filenames (PiFocusDiag_<HOST>_20260728-121233.logs) mean
+#     IT's fleet-wide log collector can't hardcode the path to fetch.
+#
+# Fix: single fixed filename `PiFocusDiag.logs`. Each run OVERWRITES the last.
+# Timestamp + hostname are already stamped INSIDE the report body (see
+# Section 0 "Run time" + "Computer" and the verdict block header), so the
+# report is still self-identifying without the collector needing to guess
+# the path.
+#
+# Fallback chain, first that succeeds wins:
+#   1. C:\pifocus\                          (preferred; needs admin to CREATE
+#                                            the folder the first time, but not
+#                                            to write to it after)
+#   2. C:\ProgramData\pifocus\              (any user can create + write here)
+#   3. User's Desktop                       (last resort - always writable)
+#   4. %TEMP%                               (very last resort)
 Line ""
-$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$outName = "PiFocusDiag_{0}_{1}.txt" -f $env:COMPUTERNAME,$stamp
-$outDir = [Environment]::GetFolderPath('Desktop'); if (-not $outDir) { $outDir = $env:TEMP }
-$outPath = Join-Path $outDir $outName
-try {
-    $script:ReportLines | Out-File -FilePath $outPath -Encoding utf8 -ErrorAction Stop
+$outName = 'PiFocusDiag.logs'   # STABLE name -- overwrites each run for reliable collection
+
+$candidates = @(
+    'C:\pifocus',
+    'C:\ProgramData\pifocus',
+    [Environment]::GetFolderPath('Desktop'),
+    $env:TEMP
+)
+
+$outPath = $null
+foreach ($dir in $candidates) {
+    if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+    try {
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+        }
+        $candidate = Join-Path $dir $outName
+        # Out-File overwrites by default -- exactly what we want. The previous
+        # run's report is intentionally not kept (IT collection grabs the
+        # freshest run every time). Add -Force so a read-only leftover file
+        # from a prior version doesn't block the write.
+        $script:ReportLines | Out-File -FilePath $candidate -Encoding utf8 -Force -ErrorAction Stop
+        $outPath = $candidate
+        break
+    } catch {
+        # Try next candidate silently -- fallbacks exist for exactly this case
+        continue
+    }
+}
+
+if ($outPath) {
     Write-Host ""
     Write-Host ("Full report saved to: {0}" -f $outPath) -ForegroundColor Green
     Write-Host "Please send that file back to the PiFocus team." -ForegroundColor Green
-} catch {
-    Write-Host ("Could not write report file: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+} else {
+    Write-Host ""
+    Write-Host "Could not write report file to ANY location (C:\pifocus, C:\ProgramData\pifocus, Desktop, %TEMP%). Copy the console output above manually." -ForegroundColor Yellow
 }
 
 # Tell IT exactly which folders to zip-and-attach for deeper investigation.
@@ -965,9 +1256,9 @@ try {
 Write-Host ""
 Write-Host "If the PiFocus team asks for more, please also zip and attach these (whichever exist):" -ForegroundColor Cyan
 $ToCollect = @(
-    "C:\ProgramData\PiFocus\Logs\Install.log",
-    "C:\ProgramData\ProgramMonitor\debugLogs\",
-    "C:\ProgramData\ProgramMonitor\daily_reports\",
+    $InstallLog,
+    $DebugLogDir,
+    $ReportsDir,
     "C:\ProgramData\Microsoft\Windows\WER\ReportArchive\",
     "C:\ProgramData\Microsoft\Windows\WER\ReportQueue\"
 )
