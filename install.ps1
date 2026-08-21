@@ -407,6 +407,30 @@ Copy-Item (Join-Path $BinDir "vcruntime140_1.dll") $ProgramDataDir -Force
 Copy-Item (Join-Path $BinDir "sentry.h") $ProgramDataDir -Force
 
 # ------------------------------
+# Harden the helper BINARIES against tamper (SAR GAP-A / F-06)
+# ------------------------------
+# Make the copied executables + DLLs SYSTEM/Admins = full, Users = read+execute
+# only (NO write, NO delete), using well-known SIDs (locale-independent):
+#   *S-1-5-18     = LocalSystem            -> Full (needed to overwrite on update)
+#   *S-1-5-32-544 = BUILTIN\Administrators -> Full (IT management / elevated update)
+#   *S-1-5-32-545 = BUILTIN\Users          -> RX only  (a standard user can run but
+#                                             cannot delete or replace the binary)
+# `/inheritance:r` drops inherited ACEs so only these three apply. The ProgramData
+# DIRECTORY is intentionally left writable so the medium-integrity helper (runs as
+# the user) can still write its runtime data: daily_reports\, debugLogs\,
+# Screenshots\, productivity_config.json, current_session/recovery files.
+Write-Log "Hardening helper binary ACLs (Users = read+execute only; no write/delete)..."
+foreach ($bin in @('HelperService.exe','crashpad_handler.exe','libcrypto-3-x64.dll','libssl-3-x64.dll','sentry.dll','msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll')) {
+    $binPath = Join-Path $ProgramDataDir $bin
+    if (Test-Path -LiteralPath $binPath) {
+        $r = & icacls $binPath /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" "*S-1-5-32-545:(RX)" 2>&1
+        Write-Log ("  icacls {0}: {1}" -f $bin, (($r | Select-Object -Last 1) -join ' '))
+    } else {
+        Write-Log ("  icacls skip (missing): {0}" -f $bin) "WARN"
+    }
+}
+
+# ------------------------------
 # Post-install verification: the files on disk MUST be fresh
 # ------------------------------
 # The preflight check upstream verified the SOURCE binaries carry the
@@ -510,7 +534,15 @@ if ($createResult -notmatch "SUCCESS") {
 cmd.exe /c "sc description $ServiceName `"$($cfg.ServiceDescription)`"" | Out-Null
 cmd.exe /c "sc privs $ServiceName SeTcbPrivilege/SeAssignPrimaryTokenPrivilege/SeIncreaseQuotaPrivilege"
 cmd.exe /c "sc sidtype $ServiceName unrestricted"
-cmd.exe /c "sc sdset $ServiceName D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;RPWPCR;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"
+# Service DACL hardening (SAR GAP-A). Authenticated Users (AU) are now READ-ONLY
+# (CCLCSWLOCRRC = query/interrogate only) instead of the old (A;;RPWPCR;;;AU) which
+# granted SERVICE_START + SERVICE_STOP -- i.e. ANY non-admin could `sc stop` the
+# service (or Stop it from Task Manager's Services tab) and silently kill monitoring.
+# SYSTEM (SY) keeps start+stop so Intune install/update still works; Administrators
+# (BA) keep full control incl. DELETE for IT management/uninstall. Net: a standard
+# (non-admin) company user can no longer start, stop, or delete the service.
+Write-Log "Applying hardened service SDDL (Authenticated Users = read-only; no start/stop)"
+cmd.exe /c "sc sdset $ServiceName D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"
 cmd.exe /c "sc failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000" | Out-Null
 
 # ------------------------------

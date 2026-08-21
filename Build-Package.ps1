@@ -101,9 +101,16 @@ $wsMarkers = @('helper.stale_killed')    # July-15+ Fast User Switch fix
 # the registry, so the next service restart silently reverts the user -- a
 # paused user gets tracked again without being told. See PAUSE-RESUME-FLOW.md.
 $wsPauseSyncMarkers = @('SET_TRACKING_ENABLED')
+# Control-plane sync (this release): WindowService talks to GET /agent/state and
+# HelperService relays the ingest stateVersion / handles POWER_RESUME. Guards
+# against packaging an old binary that predates the convergence work.
+$wsControlPlaneMarkers = @('/agent/state')
+$hsControlPlaneMarkers = @('state.version_hint')
 $hsFresh   = Test-BinaryHasNeedles -Path $srcHelper -Needles $hsMarkers
 $wsFresh   = Test-BinaryHasNeedles -Path $srcWindow -Needles $wsMarkers
 $wsPauseSyncFresh = Test-BinaryHasNeedles -Path $srcWindow -Needles $wsPauseSyncMarkers
+$wsCpFresh = Test-BinaryHasNeedles -Path $srcWindow -Needles $wsControlPlaneMarkers
+$hsCpFresh = Test-BinaryHasNeedles -Path $srcHelper -Needles $hsControlPlaneMarkers
 $hsInfo    = Get-Item $srcHelper
 $wsInfo    = Get-Item $srcWindow
 Write-Host ""
@@ -119,7 +126,14 @@ if (-not $wsFresh) {
 if (-not $wsPauseSyncFresh) {
     throw "REFUSING TO PACKAGE: $srcWindow is missing the '$($wsPauseSyncMarkers -join '/')' marker, so it predates the pause/resume state-sync fix. On that build an app-initiated pause never reaches the registry and the next service restart SILENTLY REVERTS the user. Rebuild WindowService from current source, then re-run. See PAUSE-RESUME-FLOW.md."
 }
-Write-Host ("  WindowService.exe  hasPauseSyncMarker={0}" -f $wsPauseSyncFresh)
+if (-not $wsCpFresh) {
+    throw "REFUSING TO PACKAGE: $srcWindow is missing the '$($wsControlPlaneMarkers -join '/')' marker, so it predates the control-plane sync (GET /agent/state convergence). Rebuild WindowService from current source, then re-run."
+}
+if (-not $hsCpFresh) {
+    throw "REFUSING TO PACKAGE: $srcHelper is missing the '$($hsControlPlaneMarkers -join '/')' marker, so it predates the ingest stateVersion piggyback / version-driven config refresh. Rebuild HelperService from current source, then re-run."
+}
+Write-Host ("  WindowService.exe  hasPauseSyncMarker={0}  hasControlPlaneMarker={1}" -f $wsPauseSyncFresh, $wsCpFresh)
+Write-Host ("  HelperService.exe  hasControlPlaneMarker={0}" -f $hsCpFresh)
 Write-Host "  -> both binaries carry the expected fix-markers. Proceeding to package."
 Write-Host ""
 
@@ -299,10 +313,12 @@ $stagedWindow = Join-Path $stagingRoot 'WindowService.exe'
 $stagedHsFresh = Test-BinaryHasNeedles -Path $stagedHelper -Needles $hsMarkers
 $stagedWsFresh = Test-BinaryHasNeedles -Path $stagedWindow -Needles $wsMarkers
 $stagedWsPauseSyncFresh = Test-BinaryHasNeedles -Path $stagedWindow -Needles $wsPauseSyncMarkers
+$stagedWsCpFresh = Test-BinaryHasNeedles -Path $stagedWindow -Needles $wsControlPlaneMarkers
+$stagedHsCpFresh = Test-BinaryHasNeedles -Path $stagedHelper -Needles $hsControlPlaneMarkers
 $stagedHsInfo  = Get-Item $stagedHelper
 $stagedWsInfo  = Get-Item $stagedWindow
-if (-not $stagedHsFresh -or -not $stagedWsFresh -or -not $stagedWsPauseSyncFresh) {
-    throw "STAGED FILES ARE STALE (Helper marker=$stagedHsFresh, Window marker=$stagedWsFresh, Window pause-sync marker=$stagedWsPauseSyncFresh). Something replaced the built binaries between build and staging. Investigate before shipping."
+if (-not $stagedHsFresh -or -not $stagedWsFresh -or -not $stagedWsPauseSyncFresh -or -not $stagedWsCpFresh -or -not $stagedHsCpFresh) {
+    throw "STAGED FILES ARE STALE (Helper marker=$stagedHsFresh, Window marker=$stagedWsFresh, Window pause-sync marker=$stagedWsPauseSyncFresh, Window control-plane=$stagedWsCpFresh, Helper control-plane=$stagedHsCpFresh). Something replaced the built binaries between build and staging. Investigate before shipping."
 }
 
 # --- 6. Summary --------------------------------------------------------------
