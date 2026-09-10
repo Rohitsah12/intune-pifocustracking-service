@@ -1057,6 +1057,221 @@ if ($ElectronUserTemp -and (Test-Path $ElectronUserTemp)) {
     }
 }
 
+#============================================================================ 7f
+Section "1.0.8 RELEASE VERIFICATION -- LOCK FIX + SECURITY (F-01) + FRESHNESS"
+# Self-contained verifier for the 1.0.8 service / 1.1.8 electron release:
+#   (a) the stuck-Inactive LOCK-STATE fix, and
+#   (b) security remediations F-01/F-02/F-03/F-09 (F-01 = device-token
+#       encryption-at-rest is the one directly observable on a device).
+# Everything here is READ-ONLY and degrades to INFO when a path/pipe/registry
+# value is absent. Reuses the topology already resolved above ($AgentExe /
+# $HelperExe for Intune, $ElectronBinDir for Electron). NEVER prints the token.
+$ExpectedSvcVer = [version]"1.0.8"
+$ExpectedAppVer = [version]"1.1.8"
+
+# -- helpers (local to this section) ---------------------------------------
+function Convert-ToVersionOrNull { param($s)
+    if ([string]::IsNullOrWhiteSpace([string]$s)) { return $null }
+    $m = [regex]::Match(([string]$s).Trim(), '\d+(\.\d+){1,3}')
+    if (-not $m.Success) { return $null }
+    try { return [version]$m.Value } catch { return $null }
+}
+# Fast ASCII-substring scan of a binary. Latin1 (cp28591) maps byte==codepoint,
+# so an ASCII needle matches via .NET String.IndexOf without a slow per-byte
+# PowerShell loop. Returns $true/$false, or $null if the file can't be read.
+function Test-BinaryHasString { param([string]$Path,[string]$Needle)
+    try {
+        if ([string]::IsNullOrEmpty($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $hay = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
+        return ($hay.IndexOf($Needle, [System.StringComparison]::Ordinal) -ge 0)
+    } catch { return $null }
+}
+# Live lock-state query over the PROD named pipe (length-prefixed UTF-8 JSON).
+# Write: 4-byte LE uint32 length + {"type":"GET_LOCK_STATE"}.
+# Read : 4-byte LE uint32 length + that many bytes of {"locked":<bool>,"ok":true}.
+function Get-PiFocusLockState { param([int]$TimeoutMs = 3000)
+    $pipe = $null
+    try {
+        $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.','PiFocusIPC',[System.IO.Pipes.PipeDirection]::InOut)
+        $pipe.Connect($TimeoutMs)
+        $req = [System.Text.Encoding]::UTF8.GetBytes('{"type":"GET_LOCK_STATE"}')
+        $lp  = [System.BitConverter]::GetBytes([uint32]$req.Length)
+        if (-not [System.BitConverter]::IsLittleEndian) { [Array]::Reverse($lp) }
+        $pipe.Write($lp,0,4); $pipe.Write($req,0,$req.Length); $pipe.Flush()
+        $hdr = New-Object byte[] 4; $got = 0
+        while ($got -lt 4) { $n = $pipe.Read($hdr,$got,4-$got); if ($n -le 0) { break }; $got += $n }
+        if ($got -lt 4) { return @{ ok=$false; error="no/short length header" } }
+        if (-not [System.BitConverter]::IsLittleEndian) { [Array]::Reverse($hdr) }
+        $len = [int][System.BitConverter]::ToUInt32($hdr,0)
+        if ($len -le 0 -or $len -gt 65536) { return @{ ok=$false; error="implausible length $len" } }
+        $buf = New-Object byte[] $len; $got = 0
+        while ($got -lt $len) { $n = $pipe.Read($buf,$got,$len-$got); if ($n -le 0) { break }; $got += $n }
+        $json = [System.Text.Encoding]::UTF8.GetString($buf,0,$got)
+        $obj = $null; try { $obj = $json | ConvertFrom-Json } catch {}
+        return @{ ok=$true; json=$json; obj=$obj }
+    } catch {
+        return @{ ok=$false; error=$_.Exception.Message }
+    } finally {
+        if ($pipe) { try { $pipe.Dispose() } catch {} }
+    }
+}
+
+# -- resolve the service binary THIS device actually runs (both topologies) --
+$RelSvcExe = $null
+if ($svc -and $svc.PathName) {
+    if ($svc.PathName -match '^\s*"([^"]+\.exe)"' -or $svc.PathName -match '^\s*(\S+\.exe)') { $RelSvcExe = $matches[1] }
+}
+if (-not $RelSvcExe -or -not (Test-Path -LiteralPath $RelSvcExe)) {
+    if ($Findings.AgentExe) { $RelSvcExe = $AgentExe }
+    elseif ($ElectronBinDir) { $ec = Join-Path $ElectronBinDir 'WindowService.exe'; if (Test-Path -LiteralPath $ec) { $RelSvcExe = $ec } }
+}
+if ($RelSvcExe) { Check "Resolved service binary" "INFO" $RelSvcExe }
+else { Check "Resolved service binary" "INFO" "no WindowService.exe located in either topology - dependent checks show INFO" }
+
+# -- (1) version gate: service >= 1.0.8 -------------------------------------
+$svcVer = $null
+if ($RelSvcExe -and (Test-Path -LiteralPath $RelSvcExe)) {
+    try { $svcVer = Convert-ToVersionOrNull ((Get-Item -LiteralPath $RelSvcExe).VersionInfo.FileVersion) } catch {}
+}
+if ($svcVer) {
+    if ($svcVer -ge $ExpectedSvcVer) { Check "Service version >= 1.0.8" "PASS" ("FileVersion={0} (>= {1})" -f $svcVer,$ExpectedSvcVer) }
+    else { $Findings.SvcVersionOld = $true; Check "Service version >= 1.0.8" "WARN" ("FileVersion={0} < {1} -- MISSING the stuck-Inactive lock fix AND security F-01/F-02/F-03/F-09. Redeploy 1.0.8." -f $svcVer,$ExpectedSvcVer) }
+} else { Check "Service version >= 1.0.8" "INFO" "could not read WindowService.exe FileVersion" }
+# version.txt (Intune topology writes it next to the exe)
+$vtxtVer = $null
+if (Test-Path -LiteralPath $VersionFile) { try { $vtxtVer = Convert-ToVersionOrNull ((Get-Content -LiteralPath $VersionFile -Raw)) } catch {} }
+if ($vtxtVer) {
+    if ($vtxtVer -ge $ExpectedSvcVer) { Check "version.txt >= 1.0.8" "PASS" ("{0}" -f $vtxtVer) }
+    else { $Findings.SvcVersionOld = $true; Check "version.txt >= 1.0.8" "WARN" ("{0} < {1}" -f $vtxtVer,$ExpectedSvcVer) }
+}
+
+# -- (2) lock-fix compile markers in WindowService.exe ----------------------
+if ($RelSvcExe -and (Test-Path -LiteralPath $RelSvcExe)) {
+    $hasLock = Test-BinaryHasString $RelSvcExe 'lock.reconcile'
+    $hasFus  = Test-BinaryHasString $RelSvcExe 'helper.stale_killed'
+    if     ($hasLock -eq $true)  { Check "Marker 'lock.reconcile' in binary" "PASS" "lock-state fix compiled in" }
+    elseif ($hasLock -eq $false) { $Findings.LockFixMissing = $true; Check "Marker 'lock.reconcile' in binary" "WARN" "ABSENT -- this WindowService.exe predates the lock-state fix (pre-1.0.8)" }
+    else   { Check "Marker 'lock.reconcile' in binary" "INFO" "could not scan binary" }
+    if     ($hasFus -eq $true)  { Check "Marker 'helper.stale_killed' in binary" "PASS" "fast-user-switch handling compiled in" }
+    elseif ($hasFus -eq $false) { Check "Marker 'helper.stale_killed' in binary" "WARN" "ABSENT -- fast-user-switch stale-helper handling not present (old build)" }
+    else   { Check "Marker 'helper.stale_killed' in binary" "INFO" "could not scan binary" }
+} else { Check "Lock-fix compile markers" "INFO" "WindowService.exe not located - skipping marker scan" }
+
+# -- (3) LIVE lock state over the named pipe (GET_LOCK_STATE) ----------------
+$lock = Get-PiFocusLockState 3000
+if ($lock.ok -and $null -ne $lock.obj) {
+    if ([bool]$lock.obj.locked) {
+        $Findings.LockReportedLocked = $true
+        Check "Live lock state (pipe GET_LOCK_STATE)" "WARN" ("service reports locked=TRUE. If the user is actively working, this is the stuck-Inactive bug (1.0.8 self-heals via lock.reconcile - see log scan below). raw={0}" -f $lock.json)
+    } else { Check "Live lock state (pipe GET_LOCK_STATE)" "PASS" ("locked=false (active). raw={0}" -f $lock.json) }
+} else {
+    Check "Live lock state (pipe GET_LOCK_STATE)" "INFO" ("pipe query unavailable ({0}). Service may be stopped, or a build that predates GET_LOCK_STATE." -f $lock.error)
+}
+
+# -- (4) lock.reconcile / self-heal evidence in the WindowService log --------
+if (Test-Path -LiteralPath $DebugLogDir) {
+    $wf = @(Get-ChildItem $DebugLogDir -Filter "*-WindowService.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 2)
+    if ($wf.Count -gt 0) {
+        $wev = New-Object System.Collections.Generic.List[object]
+        foreach ($f in $wf) { foreach ($o in (Read-NdjsonTail $f.FullName 6000)) { $wev.Add($o) } }
+        $rec  = @($wev | Where-Object { $_.category -eq 'lock.reconcile' })
+        $seed = @($rec | Where-Object { $_.message -match 'startup seed' })
+        $heal = @($rec | Where-Object { $_.message -match 'healing to (unlocked|locked)|self-heal' })
+        if ($rec.Count -gt 0) {
+            Check "lock.reconcile log entries" "INFO" ("{0} entr(y/ies): {1} startup-seed, {2} self-heal" -f $rec.Count,$seed.Count,$heal.Count)
+            $lastHeal = $heal | Select-Object -Last 1
+            if ($lastHeal) { Line ("    last self-heal @ {0}: {1}" -f $lastHeal.ts,$lastHeal.message) "DarkGray" }
+        } else { Check "lock.reconcile log entries" "INFO" "none in recent WindowService log (fix may not have needed to act, or build predates it)" }
+    } else { Check "lock.reconcile log entries" "INFO" "no WindowService.json logs present" }
+} else { Check "lock.reconcile log entries" "INFO" "$DebugLogDir missing" }
+
+# daily_reports metrics (stuck-Inactive shows near-zero active + large idle)
+if (Test-Path -LiteralPath $ReportsDir) {
+    $rp = @(Get-ChildItem $ReportsDir -Filter "*.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+    if ($rp.Count -gt 0) {
+        try {
+            $rep = Get-Content -LiteralPath $rp[0].FullName -Raw -ErrorAction Stop | ConvertFrom-Json
+            $act = 0; $idle = 0
+            if ($rep.metrics) {
+                if ($null -ne $rep.metrics.totalActiveSeconds) { $act  = [int]$rep.metrics.totalActiveSeconds }
+                if ($null -ne $rep.metrics.totalIdleSeconds)   { $idle = [int]$rep.metrics.totalIdleSeconds }
+            }
+            $st = if ($act -le 60 -and $idle -gt 300) { "WARN" } else { "INFO" }
+            $note = if ($st -eq "WARN") { "  <-- near-zero active + large idle: classic stuck-Inactive signature" } else { "" }
+            Check "Latest daily_reports metrics" $st ("{0}: active={1}s idle={2}s{3}" -f $rp[0].Name,$act,$idle,$note)
+        } catch { Check "Latest daily_reports metrics" "INFO" ("could not parse {0}" -f $rp[0].Name) }
+    } else { Check "Latest daily_reports metrics" "INFO" "no daily_reports json files" }
+} else { Check "Latest daily_reports metrics" "INFO" "$ReportsDir missing" }
+
+# -- (5) F-01: device-token encryption at rest (TYPE ONLY, never the value) --
+$tokRaw = $null
+if ($ConsoleSid) {
+    try { $tp = Get-ItemProperty ("Registry::HKEY_USERS\{0}\{1}" -f $ConsoleSid,$HkcuHelper) -ErrorAction Stop; if ($null -ne $tp.DeviceApiKey) { $tokRaw = $tp.DeviceApiKey } } catch {}
+}
+if ($null -eq $tokRaw) {
+    try { $tp = Get-ItemProperty ("HKCU:\{0}" -f $HkcuHelper) -ErrorAction Stop; if ($null -ne $tp.DeviceApiKey) { $tokRaw = $tp.DeviceApiKey } } catch {}
+}
+if ($null -eq $tokRaw) {
+    Check "F-01 device-token encrypted at rest" "INFO" "DeviceApiKey not present (user not signed in) - cannot assess"
+} elseif ($tokRaw -is [byte[]]) {
+    Check "F-01 device-token encrypted at rest" "PASS" ("REG_BINARY / DPAPI-encrypted (F-01 present). length={0} bytes (value hidden)" -f $tokRaw.Length)
+} else {
+    $Findings.TokenPlaintext = $true
+    Check "F-01 device-token encrypted at rest" "WARN" ("REG_SZ PLAINTEXT (pre-F-01 build -- security regression). length={0} chars (value hidden). A REG_SZ alongside a running fixed helper can also indicate the deviceKeyStore plaintext/encrypted flap." -f ([string]$tokRaw).Length)
+}
+
+# -- (6) Electron 1.1.8 SHA freshness vs service-build.json manifest ---------
+$manPath = if ($ElectronBinDir) { Join-Path $ElectronBinDir 'service-build.json' } else { $null }
+if ($manPath -and (Test-Path -LiteralPath $manPath)) {
+    try {
+        $man = Get-Content -LiteralPath $manPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        Check "service-build.json manifest" "INFO" ("serviceVersion={0} env={1}" -f $man.serviceVersion,$man.env)
+        $manV = Convert-ToVersionOrNull $man.serviceVersion
+        if ($manV -and $manV -lt $ExpectedSvcVer) { $Findings.SvcVersionOld = $true; Check "Manifest serviceVersion >= 1.0.8" "WARN" ("{0} < {1}" -f $manV,$ExpectedSvcVer) }
+        elseif ($manV) { Check "Manifest serviceVersion >= 1.0.8" "PASS" ("{0}" -f $manV) }
+        foreach ($exe in @('WindowService.exe','HelperService.exe')) {
+            $onDisk = Join-Path $ElectronBinDir $exe
+            $entry = $null; if ($man.files) { $entry = $man.files.$exe }
+            if (-not $entry -or -not $entry.sha256) { Check "Freshness: $exe" "INFO" "no sha256 in manifest"; continue }
+            if (-not (Test-Path -LiteralPath $onDisk)) { Check "Freshness: $exe" "WARN" "listed in manifest but missing on disk"; continue }
+            try {
+                $diskHash = (Get-FileHash -LiteralPath $onDisk -Algorithm SHA256 -ErrorAction Stop).Hash
+                $manHash  = [string]$entry.sha256
+                if ($diskHash -ieq $manHash) { Check "Freshness: $exe" "PASS" "SHA256 matches manifest (app deployed the shipped binary)" }
+                else {
+                    $Findings.ShaStale = $true
+                    Check "Freshness: $exe" "WARN" ("SHA256 MISMATCH vs manifest -> stale / failed redeploy. disk={0}.. manifest={1}.." -f $diskHash.Substring(0,[Math]::Min(12,$diskHash.Length)),$manHash.Substring(0,[Math]::Min(12,$manHash.Length)))
+                }
+            } catch { Check "Freshness: $exe" "INFO" ("could not hash on-disk exe: {0}" -f $_.Exception.Message) }
+        }
+    } catch { Check "service-build.json manifest" "INFO" ("present but unparseable: {0}" -f $_.Exception.Message) }
+} else {
+    Check "Electron service-build.json manifest" "INFO" "not found (Intune topology, or app not installed) - SHA freshness N/A"
+}
+# Electron app version (report + gate against 1.1.8)
+if ($ElectronAppExe -and (Test-Path -LiteralPath $ElectronAppExe)) {
+    $appVer = $null
+    try { $appVer = Convert-ToVersionOrNull ((Get-Item -LiteralPath $ElectronAppExe).VersionInfo.FileVersion) } catch {}
+    if ($appVer) {
+        if ($appVer -ge $ExpectedAppVer) { Check "Electron app version >= 1.1.8" "PASS" ("{0}" -f $appVer) }
+        else { Check "Electron app version >= 1.1.8" "WARN" ("{0} < {1} -- older desktop app; update to 1.1.8" -f $appVer,$ExpectedAppVer) }
+    } else { Check "Electron app version >= 1.1.8" "INFO" "could not read app FileVersion" }
+}
+
+# -- (7) Authenticode signature of the running service exe -------------------
+if ($RelSvcExe -and (Test-Path -LiteralPath $RelSvcExe)) {
+    try {
+        $sg = Get-AuthenticodeSignature -FilePath $RelSvcExe -ErrorAction Stop
+        $subj = if ($sg.SignerCertificate) { $sg.SignerCertificate.Subject } else { "<none>" }
+        $cn = ""; if ($subj -match 'CN=("?)([^,"]+)\1') { $cn = $matches[2].Trim() }
+        if     ($sg.Status -eq 'Valid' -and $cn -match 'PHYSICSWALLAH') { Check "Service binary signature" "PASS" ("Valid | {0}" -f $cn) }
+        elseif ($sg.Status -eq 'Valid')     { Check "Service binary signature" "WARN" ("Valid but signer='{0}' (expected 'PHYSICSWALLAH LIMITED')" -f $cn) }
+        elseif ($sg.Status -eq 'NotSigned') { Check "Service binary signature" "WARN" "NOT SIGNED - not an official PhysicsWallah build (or tampered)" }
+        else   { Check "Service binary signature" "WARN" ("{0} | {1}" -f $sg.Status,$subj) }
+    } catch { Check "Service binary signature" "INFO" $_.Exception.Message }
+}
+
 #============================================================================ 8
 Section "8. ROOT-CAUSE VERDICT"
 $verdict = New-Object System.Collections.Generic.List[string]
@@ -1180,6 +1395,27 @@ if ($Findings.AsarLoadFail -and $Findings.TokenPresent) {
 if ($Findings.ElectronCrashes) {
     Line ""
     Line (">>> ALSO: Chromium crash dumps were found in the Electron app's Crashpad dir (section 1b). The desktop app itself has been crashing. Collect %APPDATA%\pi-focus-business-app\Crashpad\reports\ for the team.") "Yellow"
+}
+
+# --- 1.0.8 release-verification callouts (lock fix + security F-01 + freshness) ---
+# Surfaced after the primary verdict: each can be a standalone reason a device
+# is misbehaving (stuck Inactive, plaintext token, stale binary) even when the
+# main data-path checks above look fine.
+if ($Findings.SvcVersionOld -or $Findings.LockFixMissing) {
+    Line ""
+    Line (">>> ALSO: OLD SERVICE BUILD (< 1.0.8). This device is missing the stuck-Inactive LOCK-STATE fix and the F-01/F-02/F-03/F-09 security remediations (see the '1.0.8 RELEASE VERIFICATION' section: version/marker below 1.0.8). Redeploy 1.0.8 (Intune package) or 1.1.8 (Electron app). Until then users can show Inactive while actually working.") "Yellow"
+}
+if ($Findings.LockReportedLocked) {
+    Line ""
+    Line (">>> ALSO: the service currently reports lock state = LOCKED (live pipe GET_LOCK_STATE). If the user is actually at their desk working, this is the stuck-Inactive symptom. On 1.0.8 the lock.reconcile self-heal should clear it within a minute; if it persists on 1.0.8, capture C:\ProgramData\ProgramMonitor\debugLogs\*-WindowService.json and grep 'lock.reconcile'.") "Yellow"
+}
+if ($Findings.TokenPlaintext) {
+    Line ""
+    Line (">>> ALSO: DEVICE TOKEN STORED AS PLAINTEXT (REG_SZ) under HKCU\$HkcuHelper\DeviceApiKey. That is the pre-F-01 storage format (F-01 stores it DPAPI-encrypted as REG_BINARY). Either an old helper is running, or the Electron deviceKeyStore overwrote the encrypted value with plaintext. Update to the 1.0.8 service / 1.1.8 app so the token is re-written encrypted. (The value itself was NOT printed.)") "Yellow"
+}
+if ($Findings.ShaStale) {
+    Line ""
+    Line (">>> ALSO: SERVICE BINARY IS STALE vs the Electron manifest (service-build.json SHA256 mismatch). The app shipped one binary but a different/older WindowService.exe or HelperService.exe is on disk - a failed or partial redeploy. Reinstall/repair the PiFocus desktop app so it re-lays the shipped binaries, then confirm the SHA matches.") "Yellow"
 }
 
 # Intermittent / historical issues - shown regardless of the primary verdict,

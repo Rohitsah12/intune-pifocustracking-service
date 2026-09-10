@@ -216,6 +216,19 @@ Write-Log "Stopping existing service..."
 cmd.exe /c "sc stop $ServiceName" | Out-Null
 Start-Sleep 3
 
+# --- Disarm the OLD service BEFORE we force-kill / copy (fixes the mid-install
+# restart race that leaves a new WindowService.exe beside a stale HelperService.exe).
+# While the service still exists, two things can bring it back up in the middle of
+# the binary copy: (1) a reboot -- start=auto would auto-launch it; (2) the recovery
+# actions (sc failure restart/...) -- the force-kill below AND Copy-ItemVerified's
+# retry-6 `taskkill /F` are ABNORMAL terminations that trip SCM recovery and restart
+# the service mid-copy (new window spawns the OLD helper, or the running .exe locks
+# the copy). Set start=disabled and clear the failure actions to close both windows.
+# The service is deleted a few lines further down (BEFORE the copy) and recreated
+# fresh with start=auto + recovery re-armed after the copy + verify.
+cmd.exe /c "sc config $ServiceName start= disabled" | Out-Null
+cmd.exe /c ('sc failure ' + $ServiceName + ' reset= 0 actions= ""') | Out-Null
+
 # Try get PID
 $pidLine = cmd.exe /c "sc queryex $ServiceName" | Select-String "PID"
 
@@ -367,6 +380,33 @@ foreach ($file in $RequiredFiles) {
 }
 
 # ------------------------------
+# Delete service BEFORE copying binaries -- wait until truly gone
+# ------------------------------
+# Moved AHEAD of the copy (it used to run after the post-install verify) so that
+# during the binary replacement there is NO registered service the SCM could
+# restart via reboot/recovery. With the service already deleted, Copy-ItemVerified's
+# retry-6 taskkill can free a lingering .exe without any chance of a recovery
+# restart racing the copy -- which is what previously risked a fresh
+# WindowService.exe running against a not-yet-replaced HelperService.exe.
+# Recreated fresh (start=auto + recovery) after the copy + verify.
+Write-Log "Deleting existing service before copy (if any)..."
+cmd.exe /c "sc delete $ServiceName" | Out-Null
+
+$waitSec = 0
+while ($waitSec -lt 30) {
+    $svcCheck = cmd.exe /c "sc query $ServiceName" 2>&1
+    if ($svcCheck -match "1060") { break }   # 1060 = service does not exist
+    Write-Log "Waiting for service deletion... ($waitSec s)"
+    Start-Sleep 2
+    $waitSec += 2
+}
+if ($waitSec -ge 30) {
+    Write-Log "Service could not be deleted within 30 seconds. Aborting." "ERROR"
+    exit 1
+}
+Write-Log "Service deleted (or was never present) -- safe to copy binaries."
+
+# ------------------------------
 # Copy binaries
 # ------------------------------
 # Use Copy-ItemVerified for the TWO service .exe files -- these are the
@@ -379,16 +419,30 @@ if (-not (Copy-ItemVerified -Src (Join-Path $BinDir "WindowService.exe") -DestDi
     Write-Log "ABORTING: could not replace WindowService.exe" "ERROR"
     exit 1
 }
-Copy-Item (Join-Path $BinDir "libcrypto-3-x64.dll") $InstallDir -Force
-Copy-Item (Join-Path $BinDir "libssl-3-x64.dll") $InstallDir -Force
-Copy-Item (Join-Path $BinDir "sentry.dll") $InstallDir -Force
-Copy-Item (Join-Path $BinDir "crashpad_handler.exe") $InstallDir -Force
-# Full app-local CRT trio - independent of whatever VC++ Redistributable
-# version is installed system-wide. Avoids the MSVCP140 14.11 ABI skew that
-# crashed WindowService.exe on devices with the 2017 redist.
-Copy-Item (Join-Path $BinDir "msvcp140.dll") $InstallDir -Force
-Copy-Item (Join-Path $BinDir "vcruntime140.dll") $InstallDir -Force
-Copy-Item (Join-Path $BinDir "vcruntime140_1.dll") $InstallDir -Force
+# Runtime support files copied through Copy-ItemVerified (retry + size-verify),
+# and ABORT if any fails. These are ABI/TLS-critical: OpenSSL (libcrypto/libssl)
+# backs every HTTPS upload, and the full app-local CRT trio (msvcp140 +
+# vcruntime140 + vcruntime140_1) avoids the MSVCP140 14.11 ABI skew that crashed
+# WindowService.exe on 2017-redist devices. The OLD code copied them with plain
+# Copy-Item under $ErrorActionPreference='Continue', so a locked/failed DLL copy
+# was swallowed silently -- leaving a FRESH .exe beside a STALE DLL (Error 1067 /
+# ABI-skew crash) while the install still reported success. Verify them like the .exe.
+$InstallSupportFiles = @(
+    "libcrypto-3-x64.dll",
+    "libssl-3-x64.dll",
+    "sentry.dll",
+    "crashpad_handler.exe",
+    "msvcp140.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll"
+)
+foreach ($f in $InstallSupportFiles) {
+    if (-not (Copy-ItemVerified -Src (Join-Path $BinDir $f) -DestDir $InstallDir)) {
+        Write-Log "ABORTING: could not copy runtime file $f to $InstallDir (ABI/TLS skew risk)" "ERROR"
+        exit 1
+    }
+}
+# sentry.h is a dev header, not a runtime dependency -- plain copy is fine.
 Copy-Item (Join-Path $BinDir "sentry.h") $InstallDir -Force
 
 
@@ -397,13 +451,16 @@ if (-not (Copy-ItemVerified -Src (Join-Path $BinDir "HelperService.exe") -DestDi
     Write-Log "ABORTING: could not replace HelperService.exe -- device would be left with stale helper" "ERROR"
     exit 1
 }
-Copy-Item (Join-Path $BinDir "libcrypto-3-x64.dll") $ProgramDataDir -Force
-Copy-Item (Join-Path $BinDir "libssl-3-x64.dll") $ProgramDataDir -Force
-Copy-Item (Join-Path $BinDir "sentry.dll") $ProgramDataDir -Force
-Copy-Item (Join-Path $BinDir "crashpad_handler.exe") $ProgramDataDir -Force
-Copy-Item (Join-Path $BinDir "msvcp140.dll") $ProgramDataDir -Force
-Copy-Item (Join-Path $BinDir "vcruntime140.dll") $ProgramDataDir -Force
-Copy-Item (Join-Path $BinDir "vcruntime140_1.dll") $ProgramDataDir -Force
+# Same verified copy for the helper's runtime support files (HelperService.exe
+# links the SAME OpenSSL + CRT trio, so a stale/failed DLL here is the identical
+# Error 1067 / ABI-skew crash on the helper side). Abort on any failure.
+foreach ($f in $InstallSupportFiles) {
+    if (-not (Copy-ItemVerified -Src (Join-Path $BinDir $f) -DestDir $ProgramDataDir)) {
+        Write-Log "ABORTING: could not copy runtime file $f to $ProgramDataDir (ABI/TLS skew risk)" "ERROR"
+        exit 1
+    }
+}
+# sentry.h is a dev header, not a runtime dependency -- plain copy is fine.
 Copy-Item (Join-Path $BinDir "sentry.h") $ProgramDataDir -Force
 
 # ------------------------------
@@ -491,30 +548,13 @@ Write-Log "POST-INSTALL VERIFICATION PASSED -- both installed binaries are fresh
 Write-Log "----------------------------------------------------------------"
 
 # ------------------------------
-# Delete service if exists - wait until truly gone
-# ------------------------------
-Write-Log "Deleting existing service (if any)..."
-cmd.exe /c "sc delete $ServiceName" | Out-Null
-
-$waitSec = 0
-while ($waitSec -lt 30) {
-    $svcCheck = cmd.exe /c "sc query $ServiceName" 2>&1
-    if ($svcCheck -match "1060") { break }   # 1060 = service does not exist
-    Write-Log "Waiting for service deletion... ($waitSec s)"
-    Start-Sleep 2
-    $waitSec += 2
-}
-
-if ($waitSec -ge 30) {
-    Write-Log "Service could not be deleted within 30 seconds. Aborting." "ERROR"
-    exit 1
-}
-
-Write-Log "Service deleted (or was never present)."
-
-# ------------------------------
 # Create service
 # ------------------------------
+# NOTE: the old service was already stopped, disarmed (start=disabled + recovery
+# cleared) and DELETED before the binary copy above -- so at this point no service
+# is registered and we create it fresh. This ordering is what prevents an SCM
+# reboot/recovery restart from racing the copy and pairing a new window binary
+# with a stale helper.
 Write-Log "Creating Windows service..."
 
 $binPath = '"' + $ServiceExe + ' --service"'
