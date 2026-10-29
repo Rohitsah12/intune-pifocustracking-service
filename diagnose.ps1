@@ -39,6 +39,11 @@ $ReportsDir   = 'C:\ProgramData\ProgramMonitor\daily_reports'
 $SentryDir    = 'C:\ProgramData\PiFocus\Agent\sentry\windowservice'
 $ServiceName  = 'PiFocusWindowService'
 $BackendHost  = 'api.penpencil.co'
+# Where the diagnostic uploads ITS OWN report. Kept on STAGE deliberately so
+# diagnostic reports land in the stage backend (the §6 connectivity probe still
+# targets $BackendHost = PROD, i.e. where the AGENT actually sends its data --
+# do NOT point the probe at stage or a prod device can read as "unreachable").
+$DiagUploadHost = 'stage-api.penpencil.co'
 $ActivitiesEP = "ingest/activities"
 $HklmRoot     = 'HKLM:\SOFTWARE\PiFocus'
 $HkcuHelper   = 'Software\PiFocus\Helper'
@@ -201,6 +206,58 @@ try {
     if ($mdmYes) { Check "Device enrollment" "PASS" ("{0} + MDM-enrolled ({1})" -f $joinType,$mdm) }
     else         { Check "Device enrollment" "INFO" ("{0}, no MDM enrollment - Intune push not possible, expect Electron install topology" -f $joinType) }
 } catch { Check "Device enrollment" "INFO" "dsregcmd not available" }
+
+# ------------ DEVICE IDENTITY the agent sends to /machine-key ---------------
+# THE crux for "no token / machine-key fails". WindowService (SystemMonitor::
+# getSerialNumber) resolves ONE id and puts it in GET /user-devices/<ID>/machine-key.
+# Resolution order:  1) BIOS serial (if usable)  2) Intune EntDMID  3) MachineGuid.
+# The backend maps devices by EntDMID -- so if EntDMID is NOT found here, the agent
+# falls through to MachineGuid, the backend can't match it, and token fetch fails
+# ("JSON parse failed on machine-key response") -> no token -> 0 hrs.
+$idBiosUsable = -not ([string]::IsNullOrWhiteSpace($serial) -or $serial -match "^(?i:default string|to be filled by o\.e\.m|to be filled|none|na|n/a|unknown|system serial number|0)$")
+
+# EntDMID -- read EXACTLY like C++ FetchIntuneDMID(): first enrolment whose
+# DMClient\MS DM Server has a non-empty EntDMID (REG_SZ).
+$entDmid = $null; $entEnrolls = 0; $entWithId = 0
+try {
+    foreach ($ek in (Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Enrollments' -ErrorAction Stop)) {
+        $dmp = Join-Path $ek.PSPath 'DMClient\MS DM Server'
+        if (Test-Path $dmp) {
+            $entEnrolls++
+            $v = (Get-ItemProperty $dmp -Name EntDMID -ErrorAction SilentlyContinue).EntDMID
+            if (-not [string]::IsNullOrWhiteSpace($v)) { $entWithId++; if (-not $entDmid) { $entDmid = "$v".ToUpper() } }
+        }
+    }
+} catch {}
+# DeviceClientId (for reference / diagnostics-upload identity)
+$devClientId = $null
+try {
+    $enr = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Enrollments\*' -ErrorAction SilentlyContinue |
+           Where-Object { $_.ProviderID -eq 'MS DM Server' -and $_.DeviceClientId } | Select-Object -First 1
+    if ($enr) { $devClientId = "$($enr.DeviceClientId)" }
+} catch {}
+$machineGuid = $null
+try { $machineGuid = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction SilentlyContinue).MachineGuid } catch {}
+
+# Mirror the agent's chain to show what it WILL send
+$resolvedId = $null; $resolvedSrc = $null
+if     ($idBiosUsable) { $resolvedId = $serial;      $resolvedSrc = 'BIOS serial' }
+elseif ($entDmid)      { $resolvedId = $entDmid;     $resolvedSrc = 'EntDMID' }
+elseif ($machineGuid)  { $resolvedId = $machineGuid; $resolvedSrc = 'MachineGuid (LAST resort)' }
+
+$Findings.EntDmidMissing    = (-not $idBiosUsable -and -not $entDmid)
+$Findings.IdentityFallbackMachineGuid = ($resolvedSrc -eq 'MachineGuid (LAST resort)')
+
+$entSt = if ($idBiosUsable) { 'INFO' } elseif ($entDmid) { 'PASS' } else { 'FAIL' }
+Check "Intune EntDMID (agent fallback ID)" $entSt $(
+    if ($idBiosUsable)  { "serial usable -> EntDMID not needed" }
+    elseif ($entDmid)   { "{0}  ({1}/{2} MS-DM-Server enrolment(s) carry EntDMID)" -f $entDmid,$entWithId,$entEnrolls }
+    else                { "NOT FOUND ({0} MS-DM-Server enrolment(s), 0 with EntDMID) -> agent falls back to MachineGuid, which the backend CANNOT map -> no token" -f $entEnrolls } )
+if ($devClientId) { Check "Intune DeviceClientId (reference)" "INFO" $devClientId }
+$resSt = if ($Findings.IdentityFallbackMachineGuid) { 'WARN' } elseif ($resolvedId) { 'PASS' } else { 'FAIL' }
+Check "Resolved identity -> machine-key" $resSt $(
+    if ($resolvedId) { "{0}   [source: {1}]   agent calls GET /user-devices/{0}/machine-key" -f $resolvedId,$resolvedSrc }
+    else             { "could not resolve any identity (no serial, no EntDMID, no MachineGuid)" } )
 
 #============================================================================ 1
 Section "1. INSTALLATION INTEGRITY"
@@ -731,23 +788,31 @@ if ($helpers.Count -eq 0) {
 Section ("4. DEVICE TOKEN / AUTH  (HKCU\{0}\DeviceApiKey)" -f $HkcuHelper)
 $token = $null
 $tokenSrc = $null
+$tokenBinary = $false
 if ($ConsoleSid) {
     try {
         $p = Get-ItemProperty ("Registry::HKEY_USERS\{0}\{1}" -f $ConsoleSid, $HkcuHelper) -ErrorAction Stop
-        if ($p.DeviceApiKey) { $token = [string]$p.DeviceApiKey; $tokenSrc = ("HKU\{0}\{1}" -f $ConsoleSid, $HkcuHelper) }
+        if ($p.DeviceApiKey) { $tokenBinary = ($p.DeviceApiKey -is [byte[]]); $token = [string]$p.DeviceApiKey; $tokenSrc = ("HKU\{0}\{1}" -f $ConsoleSid, $HkcuHelper) }
     } catch {}
 }
 if (-not $token) {
     try {
         $p = Get-ItemProperty ("HKCU:\{0}" -f $HkcuHelper) -ErrorAction Stop
-        if ($p.DeviceApiKey) { $token = [string]$p.DeviceApiKey; $tokenSrc = ("HKCU\{0}" -f $HkcuHelper) }
+        if ($p.DeviceApiKey) { $tokenBinary = ($p.DeviceApiKey -is [byte[]]); $token = [string]$p.DeviceApiKey; $tokenSrc = ("HKCU\{0}" -f $HkcuHelper) }
     } catch {}
 }
 $Findings.TokenPresent = [bool]$token
 if ($token) {
-    $looksJwt = $token.Contains(".")
-    Check "Device token present" "PASS" ("{0}  [{1}]" -f (Mask $token),$tokenSrc)
-    if (-not $looksJwt) { Check "Token format" "WARN" "no '.' separator - may be malformed" }
+    if ($tokenBinary) {
+        # F-01: token stored as REG_BINARY (DPAPI-encrypted at rest). At rest it is an
+        # opaque blob (the decrypted value is apiKeyId.secret); a '.' check on the raw
+        # bytes is meaningless, so do NOT flag "malformed". See F-01 block for length.
+        Check "Device token present" "PASS" ("REG_BINARY / DPAPI-encrypted at rest (F-01)  [{0}]" -f $tokenSrc)
+    } else {
+        $looksJwt = $token.Contains(".")
+        Check "Device token present" "PASS" ("{0}  [{1}]" -f (Mask $token),$tokenSrc)
+        if (-not $looksJwt) { Check "Token format" "WARN" "plaintext (REG_SZ) with no '.' separator - may be malformed (expected apiKeyId.secret)" }
+    }
 } else {
     Check "Device token present" "FAIL" "DeviceApiKey not set -> uploads will be unauthenticated. User likely has NOT logged into the PiFocus desktop app."
 }
@@ -883,6 +948,83 @@ if (-not (Test-Path $DebugLogDir)) {
         $tf = $transportFails | Select-Object -Last 1
         Check "Network transport failures" "FAIL" ("{0} fails; last @ {1} win32={2}" -f $transportFails.Count,$tf.ts,$tf.data.win32)
     }
+
+    # --- Token provisioning (WindowService machine-key) -- WHY the token is missing ---
+    # On a company (Intune) device there is NO desktop-app login, so the device
+    # token arrives ONLY via WindowService: GET /user-devices/<id>/machine-key, then
+    # WindowService DPAPI-encrypts it into HKU\<active-user-SID>\Software\PiFocus\Helper.
+    # Three independent failure points, each surfaced from the WindowService log:
+    #   (1) identity resolved to MachineGuid/Unknown -- BIOS + EntDMID both failed  [serial.result]
+    #   (2) the machine-key GET itself failed                                       [token.fetch ERROR]
+    #   (3) the GET succeeded but the token could NOT be persisted (no active user  [token.registry_write / token.sid]
+    #       session / DPAPI) -- "fetched but not written".
+    Line ""
+    Line "  -- Token provisioning (WindowService machine-key) --" "DarkGray"
+    # These are read from the WindowService LOG (a rolling history), so any error here may
+    # be OLD. Section 4 already read the LIVE registry into $Findings.TokenPresent. If a
+    # token IS present now, historical fetch/write/check errors are reframed as HISTORICAL
+    # (INFO) instead of FAIL, so the report never contradicts itself (token present in
+    # section 4 but "NOT present" here). If NO token is present, they stay as the FAIL.
+    $tokLiveOk = [bool]$Findings.TokenPresent
+    $wfTok = @(Get-ChildItem $DebugLogDir -Filter "*-WindowService.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 2)
+    $wvTok = New-Object System.Collections.Generic.List[object]
+    foreach ($f in $wfTok) { foreach ($o in (Read-NdjsonTail $f.FullName 6000)) { $wvTok.Add($o) } }
+
+    # (1) identity the agent ACTUALLY resolved at runtime (serial.result: BIOS/EntDMID/MachineGuid/Unknown)
+    $serRes = $wvTok | Where-Object { $_.category -eq 'serial.result' } | Select-Object -Last 1
+    if ($serRes) {
+        $src = "$($serRes.data.source)"
+        $Findings.AgentIdSource = $src
+        $Findings.IdentityIsMachineGuid = ($src -eq 'MachineGuid')
+        $sSt = if ($src -eq 'MachineGuid' -or [string]::IsNullOrWhiteSpace($src)) { 'WARN' } else { 'INFO' }
+        Check "Agent resolved identity (runtime)" $sSt ("source={0}  value={1}{2}" -f $src,$serRes.data.value,$(if ($src -eq 'MachineGuid') { "  <-- BIOS + EntDMID both failed; backend maps by EntDMID so MachineGuid will NOT match" } else { "" }))
+    }
+
+    # (2) machine-key GET outcome (token.fetch ERROR)
+    $tokFetchErr = @($wvTok | Where-Object { $_.category -eq 'token.fetch' -and $_.level -eq 'ERROR' })
+    if ($tokFetchErr.Count -gt 0) {
+        $Findings.MachineKeyFailed = $true
+        $ltf = $tokFetchErr | Select-Object -Last 1
+        $mkKind =
+            if     ($ltf.message -match 'JSON parse')                   { $Findings.MkJsonFail = $true;  'backend returned NON-JSON (device not found / not mapped, or server error)' }
+            elseif ($ltf.message -match 'HTTP send|send/receive')       { $Findings.MkHttpFail = $true;  'HTTP send/receive failed (network / proxy / TLS on this device)' }
+            elseif ($ltf.message -match 'Empty response')               { $Findings.MkEmpty = $true;     'empty response body from machine-key' }
+            elseif ($ltf.message -match 'placeholder|bad.?serial|Refus') { $Findings.MkBadSerial = $true; 'refused: placeholder serial AND EntDMID fallback failed' }
+            else                                                         { "$($ltf.message)" }
+        if ($tokLiveOk) {
+            Check "machine-key GET (token.fetch)" "INFO" ("{0} earlier failure(s); last @ {1} -> {2}  (HISTORICAL - a token IS present now, see section 4)" -f $tokFetchErr.Count,$ltf.ts,$mkKind)
+        } else {
+            Check "machine-key GET (token.fetch)" "FAIL" ("{0} failure(s); last @ {1} -> {2}" -f $tokFetchErr.Count,$ltf.ts,$mkKind)
+        }
+    } else {
+        Check "machine-key GET (token.fetch)" "INFO" "no token.fetch errors in recent WindowService log"
+    }
+
+    # (3) token WRITE outcome -- GET may have succeeded but persist failed (no active session / DPAPI)
+    $tokWriteErr = @($wvTok | Where-Object { ($_.category -eq 'token.registry_write' -or $_.category -eq 'token.sid') -and $_.level -eq 'ERROR' })
+    if ($tokWriteErr.Count -gt 0) {
+        $lw = $tokWriteErr | Select-Object -Last 1
+        if ($lw.message -match 'empty SID|no active console|CryptProtectData|impersonat') { $Findings.TokenWriteNoSession = $true }
+        if ($tokLiveOk) {
+            Check "machine-key token WRITE" "INFO" ("{0} earlier write issue(s); last: {1}  (HISTORICAL - token IS persisted now, see section 4)" -f $tokWriteErr.Count,$lw.message)
+        } else {
+            Check "machine-key token WRITE" "WARN" ("{0} write issue(s); last: {1} -> token NOT persisted (WindowService needs an active console user session to DPAPI-seal it)" -f $tokWriteErr.Count,$lw.message)
+        }
+    }
+
+    # WindowService's own present/absent verdict (token.check). This comes from the LOG, so
+    # it can be stale. Reconcile against the LIVE registry read in section 4: if the token
+    # is present now but an older log line said "NOT present", surface it as HISTORICAL,
+    # never as a FAIL that contradicts section 4.
+    $tokChk = $wvTok | Where-Object { $_.category -eq 'token.check' } | Select-Object -Last 1
+    if ($tokChk) {
+        $logSaysAbsent = ($tokChk.message -match 'NOT present')
+        if ($tokLiveOk -and $logSaysAbsent) {
+            Check "WindowService token-registry check" "INFO" ("last LOG verdict (@{0}): '{1}' - HISTORICAL; the token IS present in the live registry now (see section 4)" -f $tokChk.ts,$tokChk.message)
+        } else {
+            Check "WindowService token-registry check" $(if ($logSaysAbsent) { 'FAIL' } else { 'PASS' }) ("{0}" -f $tokChk.message)
+        }
+    }
 }
 
 # daily_reports = locally produced data
@@ -1014,6 +1156,8 @@ if ($ElectronAppLog -and (Test-Path $ElectronAppLog)) {
     $sigDailyMiss= @($tail | Where-Object { $_ -match "\[dailyReport\] File does not exist" })
     $sigAsarFail = @($tail | Where-Object { $_ -match "ERR_FAILED.*app\.asar|Failed to load URL.*app\.asar" })
     $sigOauth    = @($tail | Where-Object { $_ -match "accounts\.google\.com|Google OAuth|OAuth flow|webContents" })
+    $sigNoRefresh= @($tail | Where-Object { $_ -match "No refresh token available" })
+    $sigEperm    = @($tail | Where-Object { $_ -match "operation not permitted, copyfile|EPERM.*copyfile|helper install failed" })
     $sigVersion  = $tail | Where-Object { $_ -match "\[App\] Electron version|pi-focus-business-app/" } | Select-Object -First 1
     $sigVersion  = [string]$sigVersion
 
@@ -1027,6 +1171,8 @@ if ($ElectronAppLog -and (Test-Path $ElectronAppLog)) {
     if ($sigMulti.Count -gt 0)    {                                          Check "Electron: multi-instance restart loop" "WARN" ("seen {0}x - app keeps relaunching and re-prompting UAC" -f $sigMulti.Count) }
     if ($sigNoSvc.Count -gt 0)    {                                          Check "Electron: service state = not installed" "INFO" ("seen {0}x" -f $sigNoSvc.Count) }
     if ($sigDailyMiss.Count -gt 0){                                          Check "Electron: daily_reports missing (UI side)" "INFO" ("seen {0}x - app cannot find local data" -f $sigDailyMiss.Count) }
+    if ($sigNoRefresh.Count -gt 0){                                          Check "Electron: no refresh token" "WARN" ("seen {0}x - user never completed sign-in (or tokens cleared) -> app cannot mint the device key" -f $sigNoRefresh.Count) }
+    if ($sigEperm.Count -gt 0)    {                                          Check "Electron: helper copy EPERM (hardened dir)" "INFO" ("seen {0}x - C:\ProgramData\PiFocus files are SYSTEM-owned (Intune-hardened); Electron defers to an elevated copy. Harmless unless elevation was declined. On a company device the Electron app should be removed (Remove-PiFocusElectronApp.ps1)." -f $sigEperm.Count) }
 
     # last 15 error/warning lines from the app
     Line ""
@@ -1058,7 +1204,7 @@ if ($ElectronUserTemp -and (Test-Path $ElectronUserTemp)) {
 }
 
 #============================================================================ 7f
-Section "1.0.8 RELEASE VERIFICATION -- LOCK FIX + SECURITY (F-01) + FRESHNESS"
+Section "1.0.8 / 1.1.0 RELEASE VERIFICATION -- LOCK FIX + FUS + DYNAMIC IDLE + VERSION-REPORT + SECURITY (F-01)"
 # Self-contained verifier for the 1.0.8 service / 1.1.8 electron release:
 #   (a) the stuck-Inactive LOCK-STATE fix, and
 #   (b) security remediations F-01/F-02/F-03/F-09 (F-01 = device-token
@@ -1068,6 +1214,11 @@ Section "1.0.8 RELEASE VERIFICATION -- LOCK FIX + SECURITY (F-01) + FRESHNESS"
 # $HelperExe for Intune, $ElectronBinDir for Electron). NEVER prints the token.
 $ExpectedSvcVer = [version]"1.0.8"
 $ExpectedAppVer = [version]"1.1.8"
+# 1.1.0 = the build that adds: the fast-user-switch stuck-lock fix (served-session
+# UNLOCK always clears), the dynamic idle threshold (idleThresholdSeconds from the
+# backend), and agent-version reporting (PATCH /agent/device-version). Service >= 1.1.0
+# is the proxy for "has the FUS stuck-Inactive fix".
+$ExpectedSvcVer110 = [version]"1.1.0"
 
 # -- helpers (local to this section) ---------------------------------------
 function Convert-ToVersionOrNull { param($s)
@@ -1158,6 +1309,26 @@ if ($RelSvcExe -and (Test-Path -LiteralPath $RelSvcExe)) {
     else   { Check "Marker 'helper.stale_killed' in binary" "INFO" "could not scan binary" }
 } else { Check "Lock-fix compile markers" "INFO" "WindowService.exe not located - skipping marker scan" }
 
+# -- (2b) 1.1.0 feature presence -------------------------------------------
+# Service >= 1.1.0 carries the fast-user-switch stuck-lock fix (the served
+# session's own UNLOCK always clears, even with a stale foreign lock latch).
+# The dynamic-idle + version-report strings live in HelperService.exe.
+if ($svcVer) {
+    if ($svcVer -ge $ExpectedSvcVer110) { Check "1.1.0 fast-user-switch lock fix" "PASS" ("service {0} >= 1.1.0 -- FUS served-session UNLOCK fix present" -f $svcVer) }
+    else { Check "1.1.0 fast-user-switch lock fix" "INFO" ("service {0} < 1.1.0 -- FUS stuck-lock relies ONLY on the ~3-cycle reconcile (can stick under FUS churn). Redeploy 1.1.0 for the instant-clear fix." -f $svcVer) }
+}
+$HelperScan = $null
+if ($Findings.AgentExe -and $HelperExe -and (Test-Path -LiteralPath $HelperExe)) { $HelperScan = $HelperExe }
+elseif ($ElectronBinDir) { $eh = Join-Path $ElectronBinDir 'HelperService.exe'; if (Test-Path -LiteralPath $eh) { $HelperScan = $eh } }
+if ($HelperScan) {
+    $hasIdle = Test-BinaryHasString $HelperScan 'idleThresholdSeconds'
+    $hasDevVer = Test-BinaryHasString $HelperScan '/agent/device-version'
+    if     ($hasIdle -eq $true)  { Check "1.1.0 dynamic idle threshold" "PASS" "helper reads backend idleThresholdSeconds (dynamic AFK)" }
+    elseif ($hasIdle -eq $false) { Check "1.1.0 dynamic idle threshold" "INFO" "ABSENT -- helper predates dynamic idle (hardcoded gate)" }
+    if     ($hasDevVer -eq $true)  { Check "1.1.0 agent-version report" "PASS" "helper PATCHes /agent/device-version (version reaches backend device record)" }
+    elseif ($hasDevVer -eq $false) { Check "1.1.0 agent-version report" "INFO" "ABSENT -- helper predates device-version reporting" }
+} else { Check "1.1.0 helper feature markers" "INFO" "HelperService.exe not located - skipping idle/device-version scan" }
+
 # -- (3) LIVE lock state over the named pipe (GET_LOCK_STATE) ----------------
 $lock = Get-PiFocusLockState 3000
 if ($lock.ok -and $null -ne $lock.obj) {
@@ -1186,7 +1357,82 @@ if (Test-Path -LiteralPath $DebugLogDir) {
     } else { Check "lock.reconcile log entries" "INFO" "no WindowService.json logs present" }
 } else { Check "lock.reconcile log entries" "INFO" "$DebugLogDir missing" }
 
-# daily_reports metrics (stuck-Inactive shows near-zero active + large idle)
+# -- (4b) Fast-user-switch stuck-lock fingerprints (the fleet "inactive" cause) --
+# On a shared PC, a fast-user-switch latches the OUTGOING user's LOCK and then
+# FILTERS the INCOMING served user's UNLOCK -> the active user stays "locked" ->
+# 0% active -> Inactive. Two log fingerprints: FUS churn + the explicit
+# "dropped/filtered UNLOCK" reconcile incident.
+if (Test-Path -LiteralPath $DebugLogDir) {
+    $wf2 = @(Get-ChildItem $DebugLogDir -Filter "*-WindowService.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 2)
+    if ($wf2.Count -gt 0) {
+        $wev2 = New-Object System.Collections.Generic.List[object]
+        foreach ($f in $wf2) { foreach ($o in (Read-NdjsonTail $f.FullName 6000)) { $wev2.Add($o) } }
+        $fus = @($wev2 | Where-Object { "$($_.message)" -match 'Fast User Switch|fast-user-switch' })
+        $dropUnlock = @($wev2 | Where-Object { "$($_.message)" -match 'dropped/filtered UNLOCK|stuck-Inactive incident' })
+        if ($fus.Count -gt 0) { $Findings.IsSharedPC = $true; Check "Fast-user-switch activity" "WARN" ("{0} FUS event(s) -- SHARED PC; FUS is the stuck-lock trigger" -f $fus.Count) }
+        else { Check "Fast-user-switch activity" "INFO" "no FUS events recently (single-user, or none in window)" }
+        if ($dropUnlock.Count -gt 0) {
+            $Findings.FusDroppedUnlock = $true
+            $ld = $dropUnlock | Select-Object -Last 1
+            Check "FUS dropped/filtered UNLOCK" "WARN" ("{0} incident(s); last @ {1} -- served user's UNLOCK was filtered (stuck-Inactive). 1.1.0 clears this instantly; <1.1.0 waits on the reconcile." -f $dropUnlock.Count,$ld.ts)
+        }
+    }
+}
+
+# -- (4c) LIVE per-session lock state (multi-user / shared PC) ----------------
+# Every logged-in session: user, connect-state, and REAL lock flag
+# (WTSQuerySessionInformation WTSSessionInfoEx; SessionFlags at offset 16 -- the
+# union is 8-byte aligned, so offset 12 is SessionState, NOT the flag). The session
+# the agent SERVES should be the Active console one and UNLOCKED while the user works.
+try {
+    $sig = @"
+using System;using System.Runtime.InteropServices;
+public static class PFLk {
+ [StructLayout(LayoutKind.Sequential)] public struct SI{ public uint Id; public IntPtr Name; public int State; }
+ [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId();
+ [DllImport("wtsapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern bool WTSEnumerateSessionsW(IntPtr h,int r,int v,out IntPtr p,out int c);
+ [DllImport("wtsapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern bool WTSQuerySessionInformationW(IntPtr h,uint s,int cls,out IntPtr b,out uint n);
+ [DllImport("wtsapi32.dll")] public static extern void WTSFreeMemory(IntPtr p);
+ static string[] ST=new string[]{"Active","Connected","ConnectQuery","Shadow","Disconnected","Idle","Listen","Reset","Down","Init"};
+ public static string R(){
+  uint con=WTSGetActiveConsoleSessionId(); string o="console session="+con;
+  IntPtr p; int c; if(!WTSEnumerateSessionsW(IntPtr.Zero,0,1,out p,out c)) return o+" (enum failed)";
+  int sz=Marshal.SizeOf(typeof(SI));
+  for(int i=0;i<c;i++){ SI si=(SI)Marshal.PtrToStructure(new IntPtr(p.ToInt64()+i*sz),typeof(SI)); if(si.Id==0) continue;
+   string u=""; IntPtr b; uint n;
+   if(WTSQuerySessionInformationW(IntPtr.Zero,si.Id,5,out b,out n)&&b!=IntPtr.Zero){u=Marshal.PtrToStringUni(b);WTSFreeMemory(b);}
+   string lk="?"; if(WTSQuerySessionInformationW(IntPtr.Zero,si.Id,25,out b,out n)&&b!=IntPtr.Zero){int f=Marshal.ReadInt32(b,16);WTSFreeMemory(b);lk=(f==0?"LOCKED":f==1?"UNLOCKED":"UNKNOWN");}
+   string st=(si.State>=0&&si.State<ST.Length)?ST[si.State]:si.State.ToString();
+   o+=String.Format("\n    sid={0} user='{1}' state={2} lock={3}{4}",si.Id,u,st,lk,(si.Id==con?" <-CONSOLE":"")); }
+  WTSFreeMemory(p); return o; } }
+"@
+    if (-not ('PFLk' -as [type])) { Add-Type -TypeDefinition $sig -Language CSharp -ErrorAction Stop }
+    $sess = [PFLk]::R()
+    $sessHead = ($sess -split "`n")[0]
+    Check "Live per-session lock state" "INFO" $sessHead
+    foreach ($ln in ($sess -split "`n")) { if ($ln -match 'sid=') { Line $ln "DarkGray" } }
+} catch { Check "Live per-session lock state" "INFO" ("probe unavailable: {0}" -f $_.Exception.Message) }
+
+# -- (4d) dynamic idle threshold this device is using (from the config cache) --
+$cfgCache = 'C:\ProgramData\PiFocus\productivity_config.json'
+if (Test-Path -LiteralPath $cfgCache) {
+    try {
+        $pc = Get-Content -LiteralPath $cfgCache -Raw | ConvertFrom-Json
+        if ($null -ne $pc.idleThresholdSeconds) { Check "Dynamic idle threshold (cached)" "INFO" ("{0}s ({1:N0} min) -- from backend /agent/configurations" -f $pc.idleThresholdSeconds,($pc.idleThresholdSeconds/60.0)) }
+        else { Check "Dynamic idle threshold (cached)" "INFO" "idleThresholdSeconds not cached (pre-1.1.0 helper or config not fetched yet) -> 900s default" }
+    } catch { Check "Dynamic idle threshold (cached)" "INFO" "config cache unreadable" }
+}
+
+# daily_reports CONTENT analysis -- the KEY signal for "user shows Inactive
+# even though uploads succeed". Two independent signatures:
+#   (a) metrics:      near-zero totalActive + large totalIdle
+#   (b) applications: the "None" pseudo-app (Idle / Windows Locked / Sleep-
+#                     Standby) dominates while REAL apps captured almost no
+#                     time  -> capture-only-idle / stuck-Inactive.
+# Uses ONLY app-level name + totalSeconds; NEVER reads session identifiers /
+# window titles / urls (those are PII). Sets $Findings.InactiveOnly, which the
+# section-8 verdict uses to attribute an all-Idle day to a LOCAL cause rather
+# than misfiling it as a backend/mapping issue.
 if (Test-Path -LiteralPath $ReportsDir) {
     $rp = @(Get-ChildItem $ReportsDir -Filter "*.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
     if ($rp.Count -gt 0) {
@@ -1197,9 +1443,21 @@ if (Test-Path -LiteralPath $ReportsDir) {
                 if ($null -ne $rep.metrics.totalActiveSeconds) { $act  = [int]$rep.metrics.totalActiveSeconds }
                 if ($null -ne $rep.metrics.totalIdleSeconds)   { $idle = [int]$rep.metrics.totalIdleSeconds }
             }
-            $st = if ($act -le 60 -and $idle -gt 300) { "WARN" } else { "INFO" }
-            $note = if ($st -eq "WARN") { "  <-- near-zero active + large idle: classic stuck-Inactive signature" } else { "" }
-            Check "Latest daily_reports metrics" $st ("{0}: active={1}s idle={2}s{3}" -f $rp[0].Name,$act,$idle,$note)
+            # app-level split: name == "None" is the idle/locked/standby pseudo-app
+            $noneSec = 0; $realSec = 0; $realApps = 0
+            foreach ($a in @($rep.applications)) {
+                $sec = 0; if ($null -ne $a.totalSeconds) { $sec = [int]$a.totalSeconds }
+                if ("$($a.name)" -eq 'None') { $noneSec += $sec }
+                elseif ($sec -gt 0) { $realSec += $sec; $realApps++ }
+            }
+            $den = $act + $idle
+            $activePct = if ($den -gt 0) { [math]::Round(100.0 * $act / $den) } else { 0 }
+            # INACTIVE-ONLY = almost no REAL activity captured, yet plenty of idle/None.
+            $Findings.InactiveOnly = ( ($act -le 60 -and $idle -gt 300) -or ($realSec -lt 120 -and $noneSec -gt 600) )
+            $st = if ($Findings.InactiveOnly) { "WARN" } else { "INFO" }
+            $sig = if ($Findings.InactiveOnly) { "  <-- INACTIVE-ONLY: real-app capture ~0 while idle/None dominates (stuck-lock / old build / user genuinely away -> see verdict)" } else { "" }
+            Check "Latest daily_reports metrics" $st ("{0}: active={1}s idle={2}s ({3}% active) | real-apps={4} (activeAppSecs={5}s) idle/None={6}s{7}" -f `
+                $rp[0].Name,$act,$idle,$activePct,$realApps,$realSec,$noneSec,$sig)
         } catch { Check "Latest daily_reports metrics" "INFO" ("could not parse {0}" -f $rp[0].Name) }
     } else { Check "Latest daily_reports metrics" "INFO" "no daily_reports json files" }
 } else { Check "Latest daily_reports metrics" "INFO" "$ReportsDir missing" }
@@ -1330,7 +1588,23 @@ elseif (-not $Findings.HelperInUserSession) {
     $verdict.Add("HELPERSERVICE NOT IN THE USER SESSION: WindowService is up but the helper that actually captures windows/activity is not running in the logged-in user's session (CreateProcessAsUser failure, wrong/locked session, or AV blocking the helper). No activity is captured -> 0 hrs. Check 'helper.launch' entries in the WindowService log.")
 }
 elseif (-not $Findings.TokenPresent) {
-    if ($Findings.AsarLoadFail) {
+    if ($Findings.AgentExe -and $Findings.IntuneEnrolled -and -not $Findings.ElectronAppInstalled) {
+        # Company / Intune device: NO desktop-app login by design. The token is
+        # provisioned by WindowService via machine-key, so token-missing here is
+        # a provisioning failure, NOT "install the app".
+        $idLine = if ($resolvedId) { " Agent identity for machine-key = $resolvedId [source: $resolvedSrc]." } else { "" }
+        if ($Findings.TokenWriteNoSession) {
+            $verdict.Add("TOKEN FETCHED BUT NOT PERSISTED (Intune company device): the machine-key call worked, but WindowService could not write/DPAPI-seal the token because there was no active console user session at the time (token.registry_write / token.sid errors in section 7).$idLine FIX: this self-heals once a user logs in -- WindowService re-checks every ~5 min and writes the token into the logged-in user's hive. If it persists, confirm a user actually logs into this device.")
+        } elseif ($Findings.EntDmidMissing -or $Findings.IdentityIsMachineGuid) {
+            $verdict.Add("TOKEN NOT PROVISIONED (Intune company device): BIOS serial is a placeholder and no Intune EntDMID was resolved, so the agent falls back to MachineGuid -- which the backend (which maps by EntDMID) cannot match -> GET /user-devices/<id>/machine-key never yields a token -> no auth -> 0 hrs.$idLine FIX: this device's Intune enrolment is not exposing EntDMID under HKLM\SOFTWARE\Microsoft\Enrollments\<id>\DMClient\MS DM Server (re-check enrolment), OR map this device by MachineGuid on the backend.")
+        } elseif ($Findings.MkJsonFail) {
+            $verdict.Add("TOKEN NOT PROVISIONED (Intune company device): the agent resolved its identity (EntDMID) and called machine-key, but the backend returned a NON-JSON response (device not found / not mapped, or a server error) -> no token -> 0 hrs.$idLine This is a BACKEND / device-mapping issue, NOT a client bug. FIX: backend confirm this EntDMID is registered/mapped in user-devices and that /machine-key returns valid JSON for it. Escalate with the identity above + this device's computer name.")
+        } elseif ($Findings.MkHttpFail) {
+            $verdict.Add("TOKEN NOT PROVISIONED (Intune company device): the machine-key HTTP call itself failed (network / proxy / TLS), so the token was never fetched.$idLine FIX: check this device's connectivity to $BackendHost (section 6 - WinHTTP proxy/VPN/DNS).")
+        } else {
+            $verdict.Add("TOKEN NOT PROVISIONED (Intune company device): no device token yet. This is a company device with no desktop app (correct) -- login is NOT the fix; the token must come from the WindowService machine-key call.$idLine See the 'Token provisioning' block in section 7 and the WindowService log; escalate with the resolved identity above.")
+        }
+    } elseif ($Findings.AsarLoadFail) {
         $verdict.Add("DEVICE TOKEN MISSING + APP UI BROKEN: HKCU\$HkcuHelper\DeviceApiKey is absent AND the Electron app cannot load app.asar (ERR_FAILED in section 7d). The user can't complete login because the UI never renders. Almost always Defender/AV quarantine of the asar or a corrupted install. FIX: add a Defender exclusion for %LOCALAPPDATA%\Programs\pi-focus-business-app\ and reinstall the PiFocus app.")
     } elseif (-not $Findings.ElectronAppInstalled) {
         $verdict.Add("DEVICE TOKEN MISSING + APP NOT INSTALLED: the PiFocus desktop app .exe is not present on this user profile. The user has no way to sign in -> no token -> no upload auth. FIX: install the PiFocus desktop app.")
@@ -1353,9 +1627,21 @@ elseif ($Findings.BackendError) {
     $verdict.Add("BACKEND ERROR: the last activities upload returned HTTP $($Findings.LastUploadCode) (5xx). Local capture + auth look fine - escalate to the backend team with this device's serial and the timestamp.")
 }
 elseif ($luc -ge 200 -and $luc -lt 300) {
-    $msg = "DATA IS REACHING THE BACKEND (last activities upload HTTP $luc). If the dashboard still shows 0 hrs for this user, it is NOT a capture/upload failure on this device - escalate to backend/reporting with the device serial, the active user ($ConsoleUser), and the last-upload timestamp (likely a user/device mapping or time-window issue)."
-    if ($Findings.TransportFail) { $msg += "  (Heads-up: intermittent upload failures were also seen historically - see the intermittent-issues list below - but current uploads succeed.)" }
-    $verdict.Add($msg)
+    if ($Findings.InactiveOnly) {
+        # Uploads succeed, but this device logged almost only Idle/None today.
+        # That is a LOCAL cause, NOT a backend/mapping issue -- attribute it.
+        if ($Findings.LockReportedLocked) {
+            $verdict.Add("UPLOADING FINE, BUT SHOWS INACTIVE -> STUCK LOCK STATE. Uploads return HTTP $luc, yet this device captured almost no real activity today (see '1.0.8 RELEASE VERIFICATION' daily_reports line: real-app seconds ~0, idle/None dominant) AND the live pipe reports lock state = LOCKED. If the user is actually working, this IS the stuck-Inactive bug. FIX: on 1.0.8 the lock.reconcile self-heal clears it within ~1 min; if it persists on 1.0.8, collect $DebugLogDir\*-WindowService.json and grep 'lock.reconcile'. If the service is < 1.0.8, redeploy 1.0.8 / 1.1.8.")
+        } elseif ($Findings.SvcVersionOld -or $Findings.LockFixMissing) {
+            $verdict.Add("UPLOADING FINE, BUT SHOWS INACTIVE -> OLD BUILD MISSING THE LOCK FIX. Uploads return HTTP $luc, but real-app capture is ~0 (idle/None dominant) and this WindowService is < 1.0.8 (no 'lock.reconcile' marker). Pre-1.0.8 builds can latch Inactive after a lock/unlock or fast-user-switch and never recover -> the user shows Inactive while working. FIX: redeploy 1.0.8 (Intune) / 1.1.8 (Electron).")
+        } else {
+            $verdict.Add("UPLOADING FINE, BUT SHOWS INACTIVE (LOCAL, not backend). Uploads return HTTP $luc and the service/helper/token look healthy, yet this device logged almost only Idle/None today (real-app seconds ~0). TWO possibilities: (1) the user was genuinely away from the keyboard, or (2) capture is stuck Inactive. Disambiguate on THIS device: is the live lock state LOCKED (section 7f)? were there any 'lock.reconcile' self-heals? is the helper truly in the user's session (section 3)? If the user WAS working, collect $DebugLogDir\*-WindowService.json + *-HelperService.json and escalate with those (do NOT file this as a backend/mapping issue).")
+        }
+    } else {
+        $msg = "DATA IS REACHING THE BACKEND (last activities upload HTTP $luc) WITH real activity captured locally. If the dashboard still shows 0 hrs for this user, it is NOT a capture/upload failure on this device - escalate to backend/reporting with the device serial, the active user ($ConsoleUser), and the last-upload timestamp (likely a user/device mapping or time-window issue)."
+        if ($Findings.TransportFail) { $msg += "  (Heads-up: intermittent upload failures were also seen historically - see the intermittent-issues list below - but current uploads succeed.)" }
+        $verdict.Add($msg)
+    }
 }
 elseif ($Findings.TransportFail) {
     $verdict.Add("INTERMITTENT NETWORK UPLOADS: the backend is reachable now, but the service's WinHTTP uploads have been failing at times (api.transport_fail). win32=12007 means DNS name-not-resolved - flaky DNS/VPN/proxy on this device. Data buffers locally and should catch up when the network is stable; if 0 hrs persists, investigate this device's DNS/VPN.")
@@ -1485,6 +1771,125 @@ if ($outPath) {
 } else {
     Write-Host ""
     Write-Host "Could not write report file to ANY location (C:\pifocus, C:\ProgramData\pifocus, Desktop, %TEMP%). Copy the console output above manually." -ForegroundColor Yellow
+}
+
+# ---------------------------------------------------------------------------
+# Backend upload of the report (diagnostics ingest -- 3-call contract).
+# Intune cannot read a file back off the device, so we ALSO push the same
+# report to the backend. No auth (the script runs as SYSTEM and has none).
+#   1) POST /diagnostics/upload-url  -> reportId + fileKey + presigned uploadUrl + mimeType
+#   2) PUT the file to uploadUrl     -> Content-Type MUST equal mimeType (text/plain; S3 signs it)
+#   3) POST /diagnostics/{id}/uploaded -> flips the row PENDING -> UPLOADED
+# The SERVER picks the key -- one per run, so two diagnoses never overwrite and
+# there is no duplicate-key retry. IT reads a device's runs back with
+# GET /diagnostics?identifier=<serial-or-intuneDmId>. Entirely best-effort:
+# any failure appends one line and the script finishes normally; the local
+# file stays the primary artefact.
+#
+# NOTE: uploads to STAGE ($DiagUploadHost) by deliberate choice; the section-6
+# connectivity probe still targets PROD (where the AGENT sends its data).
+# ---------------------------------------------------------------------------
+if (-not $outPath) {
+    Write-Host ""
+    Write-Host "[WARN] No local report file was written, so there is nothing to upload. Copy the console output above manually." -ForegroundColor Yellow
+} else {
+    # Resolve identity BEFORE the try, so a WMI/registry failure shows as itself,
+    # not as an upload error. Send the SAME identifier the enrolment writes into
+    # the portal's device document: the BIOS serial on some machines, the Intune
+    # DM id on others. Send both when both exist -- the backend matches on either;
+    # at least one is required.
+    $serial = $null
+    try { $sn = (Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop).SerialNumber; if ($sn) { $serial = "$sn".Trim() } } catch {}
+    if ([string]::IsNullOrWhiteSpace($serial)) { $serial = $null }
+
+    # Intune DM id = DeviceClientId of the "MS DM Server" enrolment (a GUID). This
+    # is what the portal keys managed PCs on; NOT EntDMID. Guard hard so a missing
+    # value never becomes an empty object in the JSON body.
+    $dmId = $null
+    try {
+        $enr = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Enrollments\*' -ErrorAction SilentlyContinue |
+               Where-Object { $_.ProviderID -eq 'MS DM Server' -and $_.DeviceClientId }
+        if ($enr) { $dmId = "$((@($enr)[0]).DeviceClientId)".Trim() }
+    } catch {}
+    if ([string]::IsNullOrWhiteSpace($dmId)) { $dmId = $null }
+
+    # agentVersion (optional) = the running service binary's FileVersion.
+    $agentVersion = $null
+    try { if ($RelSvcExe -and (Test-Path -LiteralPath $RelSvcExe)) { $agentVersion = (Get-Item -LiteralPath $RelSvcExe).VersionInfo.FileVersion } } catch {}
+
+    # Surface exactly what will be sent + what IT queries back with. (The serial
+    # is already shown in section 0; the DM id is a device GUID, not a secret.)
+    Write-Host ""
+    Write-Host ("  Diagnostics upload identity:  serialNumber={0}  intuneDmId={1}" -f `
+        $(if ($serial) { $serial } else { '(none)' }), $(if ($dmId) { $dmId } else { '(none - not Intune-enrolled)' })) -ForegroundColor Cyan
+
+    if (-not $serial -and -not $dmId) {
+        Write-Host "[WARN] No BIOS serial and no Intune DM id on this device -- the backend needs at least one to file the report, so upload was skipped. The local file is still valid." -ForegroundColor Yellow
+    } else {
+        try {
+            # Old boxes default below TLS 1.2; the backend/S3 endpoints require it.
+            [Net.ServicePointManager]::SecurityProtocol =
+                [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+            $diagBase = "https://$DiagUploadHost/pi-os-backend/v1/pi-focus-business/diagnostics"
+            $size     = (Get-Item -LiteralPath $outPath).Length
+
+            # Body carries ONLY the identifiers we actually have (never an empty
+            # object -- that fails the backend's type check).
+            $slot = @{
+                deviceName = $env:COMPUTERNAME
+                fileSize   = [int]$size
+                capturedAt = (Get-Date).ToUniversalTime().ToString('o')
+            }
+            if ($serial)       { $slot.serialNumber = $serial }
+            if ($dmId)         { $slot.intuneDmId   = $dmId }
+            if ($agentVersion) { $slot.agentVersion = "$agentVersion" }
+
+            # STEP 1 -- ask for an upload slot.
+            $ticket = Invoke-RestMethod -Method Post -Uri "$diagBase/upload-url" `
+                -ContentType 'application/json' -Body ($slot | ConvertTo-Json -Compress) `
+                -TimeoutSec 60 -ErrorAction Stop
+            # Response is wrapped: { data: { reportId, uploadUrl, mimeType, fileKey, ... }, success }.
+            # Fall back to a flat body in case the shape ever changes.
+            $td = if ($ticket.data) { $ticket.data } else { $ticket }
+            if ([string]::IsNullOrWhiteSpace($td.uploadUrl) -or [string]::IsNullOrWhiteSpace($td.reportId)) {
+                throw 'upload-url response missing uploadUrl / reportId'
+            }
+            $ctype = if ($td.mimeType) { "$($td.mimeType)" } else { 'text/plain' }
+
+            # STEP 2 -- PUT the raw file. -InFile (NOT -Body) keeps the bytes verbatim
+            # so the count matches fileSize; Content-Type MUST equal mimeType (S3 signs
+            # it, a mismatch is a 403). Silence the PS 5.1 progress bar; restore after.
+            $prevProgress = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue'
+            try {
+                Invoke-WebRequest -Method Put -Uri $td.uploadUrl -InFile $outPath `
+                    -ContentType $ctype -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop | Out-Null
+            } finally {
+                $ProgressPreference = $prevProgress
+            }
+
+            # STEP 3 -- confirm (PENDING -> UPLOADED). NO body: the backend reads the
+            # object's real size from S3 itself. Call it only after the PUT returned
+            # 200; if the PUT never landed this answers 400 and the row stays PENDING.
+            Invoke-RestMethod -Method Post -Uri ("{0}/{1}/uploaded" -f $diagBase, $td.reportId) `
+                -TimeoutSec 60 -ErrorAction Stop | Out-Null
+
+            $idUsed = if ($serial) { $serial } else { $dmId }
+            $script:ReportLines += "Diagnostics uploaded: reportId=$($td.reportId) key=$($td.fileKey)"
+            Write-Host ""
+            Write-Host "==============================================================================" -ForegroundColor Green
+            Write-Host ("  Report uploaded to the backend (reportId {0})." -f $td.reportId) -ForegroundColor Green
+            Write-Host ("  IT reads it back:  GET /pi-os-backend/v1/pi-focus-business/diagnostics?identifier={0}" -f $idUsed) -ForegroundColor Green
+            Write-Host "  (needs the read:diagnostics permission; newest run first, each row carries its downloadUrl)" -ForegroundColor Green
+            Write-Host "==============================================================================" -ForegroundColor Green
+        }
+        catch {
+            $script:ReportLines += "Diagnostics upload failed: $($_.Exception.Message)"
+            Write-Host ""
+            Write-Host ("[WARN] Backend upload failed: {0}. The local report at {1} is still valid -- send that instead." -f $_.Exception.Message, $outPath) -ForegroundColor Yellow
+        }
+    }
 }
 
 # Tell IT exactly which folders to zip-and-attach for deeper investigation.

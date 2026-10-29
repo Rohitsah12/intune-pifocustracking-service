@@ -585,29 +585,49 @@ Write-Log "Applying hardened service SDDL (Authenticated Users = read-only; no s
 cmd.exe /c "sc sdset $ServiceName D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"
 cmd.exe /c "sc failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000" | Out-Null
 
-# ------------------------------
-# Verify + Start service
-# ------------------------------
 Start-Sleep 1
-
-
-Write-Log "Starting service..."
-cmd.exe /c "sc start $ServiceName"
-
-Write-Log "--------------------------------------------"
-Write-Log "PiFocus Agent Versioning Started"
-Write-Log "Target Version: $version"
 
 # ------------------------------
 # Write Version to Install Directory
+#   IMPORTANT: this runs BEFORE `sc start`, on purpose. The service was stopped +
+#   deleted + recreated above, so right now NO PiFocus process is reading
+#   version.txt. The old code wrote it AFTER sc start -- the freshly started
+#   WindowService opens version.txt (GetAgentVersion for the xx-agent-version
+#   header), and with $ErrorActionPreference='Continue' a Set-Content that lost the
+#   race failed SILENTLY while still logging "success". That stale version.txt is
+#   exactly what made detect.ps1 mismatch and Intune redeploy forever. Writing here
+#   (no reader yet) + WriteAllText (throws on failure) + readback removes the race
+#   and the silent failure both.
 # ------------------------------
+Write-Log "--------------------------------------------"
+Write-Log "PiFocus Agent Versioning Started (pre-start, race-free)"
+Write-Log "Target Version: $version"
+
 try {
     $versionFilePath = Join-Path $InstallDir "version.txt"
-    Write-Log "Writing version to file: $versionFilePath"
+    $versionToWrite  = "$version".Trim()
+    Write-Log "Writing version to file: $versionFilePath  (value='$versionToWrite')"
 
-    $version | Set-Content -Path $versionFilePath -Force
+    # Deterministic write. We do NOT use `$version | Set-Content` here any more:
+    #   - In Windows PowerShell 5.1 Set-Content's encoding is codepage-dependent and it
+    #     appends CRLF, so the on-disk bytes were nondeterministic across build boxes.
+    #   - More importantly, the field bug this fixes was Set-Content LOGGING success while
+    #     version.txt stayed stale on many devices (detect.ps1 then mismatches and Intune
+    #     redeploys forever). WriteAllText writes the exact string, no BOM, no trailing
+    #     newline -- and we read it straight back to PROVE it landed. A .NET write also
+    #     THROWS on failure (unlike Set-Content's swallowed non-terminating error).
+    [System.IO.File]::WriteAllText($versionFilePath, $versionToWrite)
 
-    Write-Log "Version file written successfully."
+    # SELF-VERIFY: read the file back and confirm it is exactly what we meant to write.
+    # Trim the same way detect.ps1 does (BOM/CR/LF/space/tab) so a stray newline from a
+    # different writer never trips this. A mismatch is a HARD FAIL -- a silent wrong
+    # version.txt is the worst outcome (invisible redeploy loop), so we surface it loudly.
+    $readBack = ([System.IO.File]::ReadAllText($versionFilePath)).Trim([char[]]@("`r","`n"," ","`t",[char]0xFEFF))
+    if ($readBack -ne $versionToWrite) {
+        Write-Log ("ABORTING: version.txt readback MISMATCH -- intended '{0}' but file reads '{1}' at {2}. Another process (e.g. a co-installed Electron app) may be overwriting it, or the write was blocked." -f $versionToWrite, $readBack, $versionFilePath) "ERROR"
+        exit 1
+    }
+    Write-Log ("Version file written AND verified: '{0}' at {1}" -f $readBack, $versionFilePath)
 }
 catch {
     Write-Log "Failed to write version file. Error: $_" "ERROR"
@@ -615,6 +635,13 @@ catch {
 }
 
 Write-Log "PiFocus Agent Versioning Completed Successfully"
+
+# ------------------------------
+# Verify + Start service  (version.txt is already on disk, so the service reads the
+# correct version the moment it comes up)
+# ------------------------------
+Write-Log "Starting service..."
+cmd.exe /c "sc start $ServiceName"
 
 # Final verdict banner -- the last thing in the install log is a
 # self-contained pass/fail summary. If this line is present with all
