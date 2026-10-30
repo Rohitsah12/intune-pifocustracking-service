@@ -584,6 +584,11 @@ cmd.exe /c "sc sidtype $ServiceName unrestricted"
 Write-Log "Applying hardened service SDDL (Authenticated Users = read-only; no start/stop)"
 cmd.exe /c "sc sdset $ServiceName D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"
 cmd.exe /c "sc failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000" | Out-Null
+# Also restart on a NON-crash error stop (service reports SERVICE_STOPPED with an
+# error code). Without this flag SCM ignores those, so an unexpected worker-thread
+# exit left the service Stopped for days (the 0%-active bug). Pairs with
+# WindowService now reporting a non-zero exit code on an unexpected stop.
+cmd.exe /c "sc failureflag $ServiceName 1" | Out-Null
 
 Start-Sleep 1
 
